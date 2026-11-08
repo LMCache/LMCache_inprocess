@@ -969,8 +969,13 @@ def test_async_lookup_and_prefetch_layerwise(autorelease_v1):
 
     class _RecordingAsyncLookupServer:
         def send_response_to_scheduler(
-            self, lookup_id: str, retrieved_length: int
+            self,
+            lookup_id: str,
+            retrieved_length: int,
+            kind: str = "",
+            epoch: int = 0,
         ) -> None:
+            del kind, epoch
             captured[lookup_id] = retrieved_length
 
     cfg = LMCacheEngineConfig.from_legacy(
@@ -1036,8 +1041,13 @@ def test_async_lookup_and_prefetch_layerwise_partial_layer_missing(autorelease_v
 
     class _RecordingAsyncLookupServer:
         def send_response_to_scheduler(
-            self, lookup_id: str, retrieved_length: int
+            self,
+            lookup_id: str,
+            retrieved_length: int,
+            kind: str = "",
+            epoch: int = 0,
         ) -> None:
+            del kind, epoch
             captured[lookup_id] = retrieved_length
 
     cfg = LMCacheEngineConfig.from_legacy(
