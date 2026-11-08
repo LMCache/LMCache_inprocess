@@ -23,7 +23,9 @@ from lmcache.inprocess.v1.tier_pipeline import (
     TierWorkerQueue,
     admission_tokens,
     completion_kind,
+    detach_tier_schedule_bridge,
     forget_preempt,
+    install_tier_schedule_bridge,
     metadata_lookup_expired,
     offer_waiting_lookups,
 )
@@ -577,6 +579,74 @@ def test_failed_prefetch_acks_zero_only_when_split_is_on():
         )
     assert off.tier_queue.is_reading("r") is False
     assert off.async_lookup_server.responses == []
+
+
+def test_detach_restores_schedule_after_the_last_impl():
+    seen: list[str] = []
+
+    class Scheduler:
+        @staticmethod
+        def schedule(scheduler, *args, **kwargs):
+            del scheduler, args, kwargs
+            seen.append("original")
+            return "ok"
+
+    class Impl:
+        def __init__(self, name: str):
+            self.name = name
+
+        def on_vllm_schedule(self, scheduler):
+            del scheduler
+            seen.append(self.name)
+
+    first, second = Impl("a"), Impl("b")
+    install_tier_schedule_bridge(Scheduler, first)
+    install_tier_schedule_bridge(Scheduler, second)
+    assert Scheduler.schedule._lmcache_tier_bridge is True
+    assert Scheduler.schedule(SimpleNamespace()) == "ok"
+    assert seen == ["a", "b", "original"]
+
+    seen.clear()
+    detach_tier_schedule_bridge(Scheduler, first)
+    assert Scheduler.schedule._lmcache_tier_bridge is True
+    Scheduler.schedule(SimpleNamespace())
+    assert seen == ["b", "original"]
+
+    original = Scheduler.schedule._lmcache_tier_original
+    detach_tier_schedule_bridge(Scheduler, second)
+    assert Scheduler.schedule is original
+    seen.clear()
+    assert Scheduler.schedule(SimpleNamespace()) == "ok"
+    assert seen == ["original"]
+    detach_tier_schedule_bridge(Scheduler, second)
+    assert Scheduler.schedule is original
+
+
+def test_lookup_while_reading_unpins_and_acks_miss():
+    backend = _Backend(1)
+    manager = _manager(True, backend)
+    old_key = object()
+    old = TierLoad(
+        num_chunks=1,
+        tiers=[(backend, [old_key], 1, [0, 4])],
+        cum_chunk_lengths_total=[0, 4],
+        tier_expected_chunks=[1],
+        keys_per_chunk=1,
+        epoch=1,
+    )
+    manager.tier_queue.note_lookup("r", 4, old)
+    assert manager.tier_queue.take_next_fitting(lambda _job: True) is not None
+    new_key = object()
+    asyncio.run(
+        manager.async_lookup_and_prefetch(
+            "r", keys=[new_key], cum_chunk_lengths=[0, 4], epoch=2
+        )
+    )
+    assert backend.gets == 0
+    assert backend.unpinned == [new_key]
+    assert manager.tier_queue.is_reading("r") is True
+    assert manager.async_lookup_server.responses == [("r", 0, "lookup")]
+    assert manager.async_lookup_server.epochs == [2]
 
 
 def test_stale_cleanup_does_not_cancel_a_newer_contains():
