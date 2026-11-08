@@ -111,7 +111,9 @@ class TierWorkerQueue:
             if current is not None:
                 self._order = [item for item in self._order if item != key]
             if hit_tokens <= 0 or job is None:
-                self._entries[key] = (STATUS_MISS, None)
+                # A miss is not a queued GET. Drop the id so finished misses
+                # do not accumulate for the life of the process.
+                self._entries.pop(key, None)
                 return True, replaced
             self._entries[key] = (STATUS_INIT, job)
             self._order.append(key)
@@ -304,6 +306,11 @@ class TierAdmission:
         self._preloaded.pop(key, None)
         self._offered_at.pop(key, None)
         self._order = [item for item in self._order if item != key]
+
+
+def forget_preempt(preempt_seen: dict[str, int], req_id: str) -> None:
+    """Drop one request's preemption count after that request has finished."""
+    preempt_seen.pop(str(req_id), None)
 
 
 def offer_waiting_lookups(

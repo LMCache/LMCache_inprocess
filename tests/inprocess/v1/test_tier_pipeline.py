@@ -13,6 +13,7 @@ import pytest
 # First Party
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.tier_pipeline import (
+    PHASE_ABSENT,
     PHASE_MISS,
     PHASE_PENDING,
     PHASE_QUEUED,
@@ -22,6 +23,7 @@ from lmcache.inprocess.v1.tier_pipeline import (
     TierWorkerQueue,
     admission_tokens,
     completion_kind,
+    forget_preempt,
     metadata_lookup_expired,
     offer_waiting_lookups,
 )
@@ -108,6 +110,7 @@ def test_worker_miss_does_not_keep_a_get_and_unfit_stays_queued():
     accepted, replaced = queue.note_lookup("miss", 0, None)
     assert accepted is True
     assert replaced is None
+    assert "miss" not in queue._entries
     assert queue.take_next_fitting(lambda _job: True) is None
     assert queue.has_waiting() is False
 
@@ -231,10 +234,11 @@ class _Backend:
 class _Ack:
     def __init__(self):
         self.responses = []
+        self.epochs: list[int] = []
 
     def send_response_to_scheduler(self, lookup_id, num_hit_tokens, kind="", epoch=0):
-        del epoch
         self.responses.append((lookup_id, num_hit_tokens, kind))
+        self.epochs.append(int(epoch))
 
 
 def _manager(split: bool, backend: _Backend):
@@ -321,6 +325,12 @@ def test_preempt_cancels_pending_and_offers_again():
     assert client.tier_admission.phase("a") == PHASE_PENDING
     assert client.tier_admission.generation("a") != first
     assert client.tier_admission.inflight() == 1
+
+    offer_waiting_lookups(scheduler, client, prepare, window=2, preempt_seen=seen)
+    assert client.retired == ["a"]
+    assert "a" in seen
+    forget_preempt(seen, "a")
+    assert "a" not in seen
 
 
 def test_retired_generation_does_not_take_the_old_ack():
@@ -455,6 +465,118 @@ def test_stale_cleanup_epoch_does_not_unpin():
     assert manager.abort_tier_load("r", 2) is True
     assert manager.tier_queue.has_waiting() is False
     assert backend.unpinned == [key]
+
+
+def test_preloaded_zero_misses_queued_and_leaves_miss_and_absent():
+    admission = TierAdmission()
+    admission.offer("queued")
+    admission.note("queued", "lookup", 8)
+    assert admission.phase("queued") == PHASE_QUEUED
+    admission.note("queued", "preloaded", 0)
+    assert admission.phase("queued") == PHASE_MISS
+    assert admission_tokens(admission.phase("queued"), None) == 0
+
+    admission.note("queued", "preloaded", 0)
+    assert admission.phase("queued") == PHASE_MISS
+
+    assert admission.phase("absent") == PHASE_ABSENT
+    admission.note("absent", "preloaded", 0)
+    assert admission.phase("absent") == PHASE_ABSENT
+    assert admission_tokens(admission.phase("absent"), None) is None
+
+
+class _Events:
+    def update_event_status(self, *args, **kwargs):
+        return None
+
+
+class _Mem:
+    def __init__(self):
+        self.is_pinned = True
+        self.unpinned = False
+        self.released = False
+
+    def unpin(self):
+        self.unpinned = True
+        self.is_pinned = False
+
+    def ref_count_down(self):
+        self.released = True
+
+
+def _failed_future(message: str):
+    loop = asyncio.new_event_loop()
+    try:
+        future = loop.create_future()
+        future.set_exception(RuntimeError(message))
+        return future
+    finally:
+        loop.close()
+
+
+def test_aborted_read_acks_zero_preloaded_and_releases():
+    backend = _Backend(0)
+    manager = _manager(True, backend)
+    manager.event_manager = _Events()
+    key = object()
+    mem = _Mem()
+    load = TierLoad(
+        num_chunks=1,
+        tiers=[(backend, [key], 1, [0, 4])],
+        cum_chunk_lengths_total=[0, 4],
+        tier_expected_chunks=[1],
+        keys_per_chunk=1,
+        epoch=3,
+    )
+    manager.tier_queue.note_lookup("r", 4, load)
+    assert manager.tier_queue.take_next_fitting(lambda _job: True) is not None
+    manager._tier_abort["r"] = 3
+    loop = asyncio.new_event_loop()
+    try:
+        future = loop.create_future()
+        future.set_result([[(key, mem)]])
+        manager.prefetch_all_done_callback(
+            future, "r", [0, 4], [1], keys_per_chunk=1, epoch=3
+        )
+    finally:
+        loop.close()
+    assert manager.tier_queue.is_reading("r") is False
+    assert mem.unpinned is True
+    assert mem.released is True
+    assert manager.async_lookup_server.responses == [("r", 0, "preloaded")]
+    assert manager.async_lookup_server.epochs == [3]
+
+
+def test_failed_prefetch_acks_zero_only_when_split_is_on():
+    reading = TierLoad(
+        num_chunks=1,
+        tiers=[],
+        cum_chunk_lengths_total=[0, 4],
+        tier_expected_chunks=[1],
+        keys_per_chunk=1,
+        epoch=2,
+    )
+    split = _manager(True, _Backend(0))
+    split.event_manager = _Events()
+    split.tier_queue.note_lookup("r", 4, reading)
+    assert split.tier_queue.take_next_fitting(lambda _job: True) is not None
+    split.prefetch_all_done_callback(
+        _failed_future("split"), "r", [0, 4], [1], keys_per_chunk=1, epoch=2
+    )
+    assert split.tier_queue.is_reading("r") is False
+    assert split.async_lookup_server.responses == [("r", 0, "preloaded")]
+    assert split.async_lookup_server.epochs == [2]
+
+    off = _manager(False, _Backend(0))
+    off.event_manager = _Events()
+    off.tier_queue.note_lookup("r", 4, reading)
+    assert off.tier_queue.take_next_fitting(lambda _job: True) is not None
+    with pytest.raises(RuntimeError, match="off"):
+        off.prefetch_all_done_callback(
+            _failed_future("off"), "r", [0, 4], [1], keys_per_chunk=1, epoch=2
+        )
+    assert off.tier_queue.is_reading("r") is False
+    assert off.async_lookup_server.responses == []
 
 
 def test_stale_cleanup_does_not_cancel_a_newer_contains():
