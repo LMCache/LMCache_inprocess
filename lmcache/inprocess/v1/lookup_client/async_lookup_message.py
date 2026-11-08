@@ -56,6 +56,9 @@ class LookupCleanupMsg(AsyncLookupMsg):
     """Cleanup message from scheduler to worker to release memory objects"""
 
     lookup_id: str
+    # The attempt being cancelled. 0 keeps the previous "cancel whatever is
+    # current" behavior for lookups that were not started on the split path.
+    epoch: int = 0
 
     def describe(self) -> str:
         return f"Cleanup memory for lookup_id={self.lookup_id}"
