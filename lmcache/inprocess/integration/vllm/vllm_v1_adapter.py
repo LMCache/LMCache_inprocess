@@ -49,6 +49,7 @@ from lmcache.inprocess.v1.config_base import validate_and_set_config_value
 from lmcache.inprocess.v1.manager import LMCacheManager
 from lmcache.inprocess.v1.tier_pipeline import (
     admission_tokens,
+    forget_preempt,
     metadata_lookup_expired,
     offer_waiting_lookups,
 )
@@ -1969,6 +1970,10 @@ class LMCacheConnectorV1Impl:
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
+        seen = getattr(self, "_tier_preempt_seen", None)
+        if isinstance(seen, dict):
+            forget_preempt(seen, request.request_id)
+
         # Layerwise save uses request-scoped generators. If request finishes
         # without entering wait_for_save (abort/error/evict path), make sure
         # we release the generator entry to avoid leaking state.
