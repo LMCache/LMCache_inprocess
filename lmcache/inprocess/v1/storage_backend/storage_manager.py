@@ -1107,7 +1107,7 @@ class StorageManager:
             return
         self._track_tier_lookup(lookup_id, int(epoch))
 
-    def abort_tier_load(self, lookup_id: str) -> bool:
+    def abort_tier_load(self, lookup_id: str, epoch: int = 0) -> bool:
         """Drop a queued GET. A GET already running is released when it finishes.
 
         A lookup whose metadata contains is still running is recorded and
@@ -1115,11 +1115,17 @@ class StorageManager:
         manager that never built the tier queue leaves cleanup to the caller.
         An id that is neither open nor queued returns False so a finished
         prefetch is still released.
+
+        A non-zero ``epoch`` only cancels that attempt. A newer lookup with the
+        same id is left alone, and this returns True so the caller does not
+        release the newer LOADING event.
         """
         queue = getattr(self, "tier_queue", None)
         if queue is None:
             return False
-        epoch = int(self._tier_epoch_inflight.get(lookup_id, 0))
+        if int(epoch) != 0:
+            return self._abort_one_epoch(lookup_id, int(epoch))
+        current = int(self._tier_epoch_inflight.get(lookup_id, 0))
         job = queue.drop_if_waiting(lookup_id)
         if job is not None:
             self._unpin_tier_load(job)
@@ -1127,9 +1133,37 @@ class StorageManager:
             return True
         if queue.is_reading(lookup_id):
             reading = queue.reading_epoch(lookup_id)
-            self._tier_abort[lookup_id] = epoch if reading is None else reading
+            self._tier_abort[lookup_id] = current if reading is None else reading
             return False
         if lookup_id in self._tier_open:
+            self._tier_abort[lookup_id] = current
+            return True
+        self._tier_abort.pop(lookup_id, None)
+        return False
+
+    def _abort_one_epoch(self, lookup_id: str, epoch: int) -> bool:
+        queue = self.tier_queue
+        waiting_epoch = getattr(queue, "waiting_epoch", None)
+        if callable(waiting_epoch):
+            waiting = waiting_epoch(lookup_id)
+            if waiting is not None:
+                if int(waiting) != epoch:
+                    return True
+                job = queue.drop_if_waiting(lookup_id)
+                if job is not None:
+                    self._unpin_tier_load(job)
+                    self._tier_abort.pop(lookup_id, None)
+                    return True
+        if queue.is_reading(lookup_id):
+            reading = queue.reading_epoch(lookup_id)
+            if reading is not None and int(reading) != epoch:
+                return True
+            self._tier_abort[lookup_id] = epoch if reading is None else int(reading)
+            return False
+        if lookup_id in self._tier_open:
+            inflight = int(self._tier_epoch_inflight.get(lookup_id, 0))
+            if inflight != epoch:
+                return True
             self._tier_abort[lookup_id] = epoch
             return True
         self._tier_abort.pop(lookup_id, None)

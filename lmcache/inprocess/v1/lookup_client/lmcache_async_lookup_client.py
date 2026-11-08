@@ -330,6 +330,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
             }
         if self.tier_admission is not None:
             self.tier_admission.clear(lookup_id)
+        self._tier_epoch.pop(lookup_id, None)
 
     def retire_lookup(self, lookup_id: str) -> None:
         """Drop a lookup so another one can be offered. Does not mark a miss.
@@ -340,6 +341,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         """
         if self.tier_admission is None:
             return
+        epoch = int(self.tier_admission.generation(lookup_id))
         self.tier_admission.retire(lookup_id)
         self._tier_epoch.pop(lookup_id, None)
         with self.lock:
@@ -348,7 +350,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                 for key, value in self._tier_parts.items()
                 if key[0] != lookup_id
             }
-        self._send_cleanup_message(lookup_id)
+        self._send_cleanup_message(lookup_id, epoch)
 
     def cancel_lookup(self, lookup_id: str) -> None:
         """Mark lookup as aborted. Cleanup will happen after task finishes.
@@ -359,8 +361,16 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         if self.tier_admission is not None:
             # Miss releases the in-flight slot. The worker drops a GET that
             # has not started; a GET already running frees its buffers.
-            self.tier_admission.note(lookup_id, "lookup", 0)
-            self._send_cleanup_message(lookup_id)
+            epoch = int(self._tier_epoch.get(lookup_id, 0))
+            self.tier_admission.mark_miss(lookup_id)
+            self._tier_epoch.pop(lookup_id, None)
+            with self.lock:
+                self._tier_parts = {
+                    key: value
+                    for key, value in self._tier_parts.items()
+                    if key[0] != lookup_id
+                }
+            self._send_cleanup_message(lookup_id, epoch)
             return
         self.aborted_lookups.add(lookup_id)
 
@@ -381,9 +391,9 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
             self._send_cleanup_message(lookup_id)
             self.clear_lookup_status(lookup_id)
 
-    def _send_cleanup_message(self, lookup_id: str) -> None:
+    def _send_cleanup_message(self, lookup_id: str, epoch: int = 0) -> None:
         """Send cleanup message to workers to release memory objects."""
-        msg = LookupCleanupMsg(lookup_id=lookup_id)
+        msg = LookupCleanupMsg(lookup_id=lookup_id, epoch=int(epoch))
         msg_buf = msgspec.msgpack.encode(msg)
 
         for i in range(self.world_size):
@@ -484,7 +494,9 @@ class LMCacheAsyncLookupServer:
 
                 elif isinstance(msg, LookupCleanupMsg):
                     # Handle cleanup request - release memory objects for aborted lookup
-                    self.lmcache_engine.cleanup_memory_objs(msg.lookup_id)
+                    self.lmcache_engine.cleanup_memory_objs(
+                        msg.lookup_id, epoch=int(getattr(msg, "epoch", 0))
+                    )
 
                 else:
                     logger.warning("Unknown message type: %s", type(msg))

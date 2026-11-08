@@ -150,6 +150,14 @@ class TierWorkerQueue:
             self._order = [item for item in self._order if item != key]
             return current[1]
 
+    def waiting_epoch(self, req_id: str) -> Optional[int]:
+        """Epoch of a hit that has not started GET. None when it is not waiting."""
+        with self._lock:
+            current = self._entries.get(str(req_id))
+            if current is None or current[0] != STATUS_INIT or current[1] is None:
+                return None
+            return int(current[1].epoch)
+
     def is_reading(self, req_id: str) -> bool:
         with self._lock:
             current = self._entries.get(str(req_id))
@@ -214,22 +222,47 @@ class TierAdmission:
             if phase in (PHASE_MISS, PHASE_READY):
                 return
             if kind == "reading":
+                # GET has started, so the metadata wait is over even if the
+                # lookup ACK has not been applied yet.
+                if phase == PHASE_PENDING:
+                    self._phase[key] = PHASE_QUEUED
+                    self._offered_at.pop(key, None)
                 return
             if kind == "lookup":
                 if tokens <= 0:
-                    self._phase[key] = PHASE_MISS
-                    self._offered_at.pop(key, None)
+                    if phase == PHASE_PENDING:
+                        self._phase[key] = PHASE_MISS
+                        self._offered_at.pop(key, None)
                 elif phase == PHASE_PENDING:
                     self._phase[key] = PHASE_QUEUED
                     self._offered_at.pop(key, None)
                 return
             if kind in ("preloaded", ""):
+                # A body ACK for an id that is not in this lookup is ignored.
+                # That includes a late ACK after clear_lookup_status.
+                if phase not in (PHASE_PENDING, PHASE_QUEUED):
+                    return
                 self._offered_at.pop(key, None)
                 if tokens <= 0:
                     self._phase[key] = PHASE_MISS
                 else:
                     self._phase[key] = PHASE_READY
                     self._preloaded[key] = int(tokens)
+
+    def mark_miss(self, req_id: str) -> None:
+        """End a lookup the scheduler itself cancelled.
+
+        A metadata ACK of zero does not do this once the phase is queued,
+        because that ACK can arrive reordered behind a GET that already
+        started. Cancellation still has to release the slot.
+        """
+        key = str(req_id)
+        with self._lock:
+            phase = self._phase.get(key, PHASE_ABSENT)
+            if phase not in (PHASE_PENDING, PHASE_QUEUED):
+                return
+            self._phase[key] = PHASE_MISS
+            self._offered_at.pop(key, None)
 
     def phase(self, req_id: str) -> str:
         with self._lock:
@@ -243,6 +276,11 @@ class TierAdmission:
         """Lookups that have been sent and have not received a metadata ACK."""
         with self._lock:
             return sum(1 for phase in self._phase.values() if phase == PHASE_PENDING)
+
+    def queued(self) -> int:
+        """Hits whose body is not in host memory yet. These hold prefix pins."""
+        with self._lock:
+            return sum(1 for phase in self._phase.values() if phase == PHASE_QUEUED)
 
     def clear(self, req_id: str) -> None:
         key = str(req_id)
@@ -278,7 +316,9 @@ def offer_waiting_lookups(
     """Offer one metadata lookup per waiting request, capped by ``window``.
 
     Does not pop vLLM's waiting queue and does not read free HBM. ``window``
-    is ``max_num_seqs``: only in-flight lookups hold a slot.
+    is ``max_num_seqs``. A lookup that has not received its metadata ACK and a
+    hit that is still waiting for host memory each hold one slot. The second
+    kind is not a miss and does not use ``lookup_timeout_ms``.
     """
     admission = getattr(client, "tier_admission", None)
     submit = getattr(client, "submit_lookup", None)
@@ -288,7 +328,8 @@ def offer_waiting_lookups(
         limit = max(1, int(window))
     except (TypeError, ValueError):
         limit = 1
-    occupied = int(admission.inflight())
+    queued = getattr(admission, "queued", None)
+    occupied = int(admission.inflight()) + (int(queued()) if callable(queued) else 0)
     for queue_name in ("waiting", "skipped_waiting"):
         waiting = getattr(scheduler, queue_name, None)
         if waiting is None:
@@ -315,6 +356,8 @@ def offer_waiting_lookups(
                     retire(req_id)
                 else:
                     admission.retire(req_id)
+                if phase in (PHASE_PENDING, PHASE_QUEUED):
+                    occupied = max(0, occupied - 1)
                 phase = PHASE_ABSENT
             if preempt_n > seen:
                 preempt_seen[req_id] = preempt_n

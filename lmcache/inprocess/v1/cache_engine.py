@@ -1405,7 +1405,7 @@ class LMCacheEngine:
             self.storage_manager.loop,
         )
 
-    def cleanup_memory_objs(self, lookup_id: str) -> None:
+    def cleanup_memory_objs(self, lookup_id: str, epoch: int = 0) -> None:
         """
         Cleanup memory objects allocated during prefetch for an aborted lookup.
 
@@ -1419,7 +1419,7 @@ class LMCacheEngine:
             # event cleanup instead of leaving those pins held.
             if callable(abort):
                 try:
-                    if abort(lookup_id):
+                    if abort(lookup_id, epoch):
                         return
                 except Exception:
                     logger.debug(
