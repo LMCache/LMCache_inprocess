@@ -863,9 +863,11 @@ class StorageManager:
                     if num_total_hit_chunks
                     else 0
                 )
-                # Metadata only. A miss does not start a GET.
-                self._send_tier_ack(lookup_id, hit_tokens, "lookup", epoch)
+                # Metadata only. A miss does not start a GET. A positive hit
+                # is queued before the ACK so a GET that is already reading
+                # cannot leave the scheduler waiting for a body we dropped.
                 if hit_tokens <= 0:
+                    self._send_tier_ack(lookup_id, 0, "lookup", epoch)
                     self.tier_queue.note_lookup(lookup_id, 0, None)
                     return
                 load = TierLoad(
@@ -881,8 +883,12 @@ class StorageManager:
                 )
                 if replaced is not None:
                     self._unpin_tier_load(replaced)
-                if accepted:
-                    self._schedule_tier_drain()
+                if not accepted:
+                    self._unpin_deferred(deferred_tiers)
+                    self._send_tier_ack(lookup_id, 0, "lookup", epoch)
+                    return
+                self._send_tier_ack(lookup_id, hit_tokens, "lookup", epoch)
+                self._schedule_tier_drain()
                 return
 
             # If no chunks were hit across all backends, respond immediately and return.
