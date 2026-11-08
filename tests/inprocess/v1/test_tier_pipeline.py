@@ -361,6 +361,51 @@ def test_only_pending_metadata_expires():
     assert admission_tokens(admission.phase("queued"), 0) is None
 
 
+def test_preloaded_on_absent_is_not_ready():
+    admission = TierAdmission()
+    admission.note("r", "preloaded", 128)
+    admission.note("r", "", 32)
+    assert admission.phase("r") == "absent"
+    assert admission_tokens(admission.phase("r"), 0) is None
+
+
+def test_reading_before_lookup_leaves_the_window():
+    admission = TierAdmission()
+    admission.offer("r")
+    assert admission.inflight() == 1
+    admission.note("r", "reading", 0)
+    assert admission.phase("r") == PHASE_QUEUED
+    assert admission.inflight() == 0
+    assert admission.queued() == 1
+    # A reordered miss ACK must not undo a GET that has already started.
+    admission.note("r", "lookup", 0)
+    assert admission.phase("r") == PHASE_QUEUED
+    assert admission_tokens(admission.phase("r"), 0) is None
+    admission.mark_miss("r")
+    assert admission.phase("r") == PHASE_MISS
+    assert admission_tokens(admission.phase("r"), 0) == 0
+
+
+def test_queued_fills_the_offer_window():
+    waiting = [_Request("a", [1]), _Request("b", [2])]
+    scheduler = SimpleNamespace(
+        waiting=waiting, skipped_waiting=[], scheduler_config=None
+    )
+    client = _Client()
+    seen: dict[str, int] = {}
+
+    def prepare(request):
+        return list(request.all_token_ids), None
+
+    offer_waiting_lookups(scheduler, client, prepare, window=1, preempt_seen=seen)
+    assert client.sent == ["a"]
+    client.tier_admission.note("a", "lookup", 8)
+    assert client.tier_admission.inflight() == 0
+    assert client.tier_admission.queued() == 1
+    offer_waiting_lookups(scheduler, client, prepare, window=1, preempt_seen=seen)
+    assert client.sent == ["a"]
+
+
 class _AbortBackend(_Backend):
     def __init__(self, manager_holder: dict):
         super().__init__(2)
@@ -389,3 +434,33 @@ def test_abort_during_contains_does_not_get():
     assert manager.tier_queue.has_waiting() is False
     assert manager.async_lookup_server.responses == []
     assert manager._tier_abort == {}
+
+
+def test_stale_cleanup_epoch_does_not_unpin():
+    backend = _Backend(2)
+    manager = _manager(True, backend)
+    key = object()
+    load = TierLoad(
+        num_chunks=1,
+        tiers=[(backend, [key], 1, [0, 4])],
+        cum_chunk_lengths_total=[0, 4],
+        tier_expected_chunks=[1],
+        keys_per_chunk=1,
+        epoch=2,
+    )
+    manager.tier_queue.note_lookup("r", 4, load)
+    assert manager.abort_tier_load("r", 1) is True
+    assert manager.tier_queue.has_waiting() is True
+    assert backend.unpinned == []
+    assert manager.abort_tier_load("r", 2) is True
+    assert manager.tier_queue.has_waiting() is False
+    assert backend.unpinned == [key]
+
+
+def test_stale_cleanup_does_not_cancel_a_newer_contains():
+    backend = _Backend(0)
+    manager = _manager(True, backend)
+    manager.note_tier_lookup_started("r", 2)
+    assert manager.abort_tier_load("r", 1) is True
+    assert manager._tier_abort == {}
+    assert "r" in manager._tier_open
