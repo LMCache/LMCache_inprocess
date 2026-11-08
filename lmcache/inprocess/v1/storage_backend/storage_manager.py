@@ -590,10 +590,20 @@ class StorageManager:
         self.event_manager.update_event_status(
             EventType.LOADING, lookup_id, status=EventStatus.DONE
         )
-        res = task.result()
+        try:
+            res = task.result()
+        except Exception:
+            logger.exception("Prefetch failed for lookup id %s", lookup_id)
+            self.tier_queue.finish(lookup_id)
+            if self._split_metadata_lookup_enabled():
+                self._send_tier_ack(lookup_id, 0, "preloaded", epoch)
+                return
+            raise
         self.tier_queue.finish(lookup_id)
         if self._consume_tier_abort(lookup_id, epoch):
             self._release_prefetch_result(res)
+            if self._split_metadata_lookup_enabled():
+                self._send_tier_ack(lookup_id, 0, "preloaded", epoch)
             return
 
         # Calculate total retrieved chunks across all tiers based on actual results
