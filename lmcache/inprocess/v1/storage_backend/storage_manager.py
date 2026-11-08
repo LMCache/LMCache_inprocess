@@ -279,6 +279,7 @@ class StorageManager:
         self.tier_queue = TierWorkerQueue()
         # lookup_id -> epoch of the attempt that was cancelled.
         self._tier_abort: dict[str, int] = {}
+        self._tier_cancelled: dict[str, set[int]] = {}
         self._tier_open: set[str] = set()
         self._tier_epoch_inflight: dict[str, int] = {}
         self._tier_drain_task: Optional[asyncio.Task] = None
@@ -769,6 +770,9 @@ class StorageManager:
         # we also keep track of the keys for each tier and each chunk
         loading_task_keys: list[list[CacheEngineKey]] = []
         split = self._split_metadata_lookup_enabled()
+        if split and self._consume_cancelled_epoch(lookup_id, epoch):
+            # Cleanup arrived before this attempt was marked open. Do not pin.
+            return
         if split:
             self._track_tier_lookup(lookup_id, epoch)
         try:
@@ -1121,6 +1125,8 @@ class StorageManager:
         """
         if not self._split_metadata_lookup_enabled():
             return
+        if self._cancelled_epoch(lookup_id, int(epoch)):
+            return
         self._track_tier_lookup(lookup_id, int(epoch))
 
     def abort_tier_load(self, lookup_id: str, epoch: int = 0) -> bool:
@@ -1182,8 +1188,37 @@ class StorageManager:
                 return True
             self._tier_abort[lookup_id] = epoch
             return True
-        self._tier_abort.pop(lookup_id, None)
+        # This attempt has not started. Remember it so the late request does
+        # not pin. False still lets the caller release a finished prefetch.
+        self._remember_cancelled_epoch(lookup_id, epoch)
         return False
+
+    def _remember_cancelled_epoch(self, lookup_id: str, epoch: int) -> None:
+        cancelled = getattr(self, "_tier_cancelled", None)
+        if not isinstance(cancelled, dict):
+            cancelled = {}
+            self._tier_cancelled = cancelled
+        bucket = cancelled.get(lookup_id)
+        if bucket is None:
+            bucket = set()
+            cancelled[lookup_id] = bucket
+        bucket.add(int(epoch))
+
+    def _cancelled_epoch(self, lookup_id: str, epoch: int) -> bool:
+        cancelled = getattr(self, "_tier_cancelled", None)
+        if not isinstance(cancelled, dict):
+            return False
+        bucket = cancelled.get(lookup_id)
+        return bool(bucket) and int(epoch) in bucket
+
+    def _consume_cancelled_epoch(self, lookup_id: str, epoch: int) -> bool:
+        if not self._cancelled_epoch(lookup_id, epoch):
+            return False
+        bucket = self._tier_cancelled[lookup_id]
+        bucket.discard(int(epoch))
+        if not bucket:
+            self._tier_cancelled.pop(lookup_id, None)
+        return True
 
     def _track_tier_lookup(self, lookup_id: str, epoch: int) -> None:
         if lookup_id not in self._tier_open:

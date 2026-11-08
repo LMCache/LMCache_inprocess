@@ -253,6 +253,7 @@ def _manager(split: bool, backend: _Backend):
     manager.tier_queue = TierWorkerQueue()
     manager.async_lookup_server = _Ack()
     manager._tier_abort = {}
+    manager._tier_cancelled = {}
     manager._tier_open = set()
     manager._tier_epoch_inflight = {}
     manager.loop = SimpleNamespace(is_running=lambda: False)
@@ -647,6 +648,35 @@ def test_lookup_while_reading_unpins_and_acks_miss():
     assert manager.tier_queue.is_reading("r") is True
     assert manager.async_lookup_server.responses == [("r", 0, "lookup")]
     assert manager.async_lookup_server.epochs == [2]
+
+
+def test_cleanup_before_lookup_does_not_pin_or_queue():
+    backend = _Backend(1)
+    manager = _manager(True, backend)
+    assert manager.abort_tier_load("r", 1) is False
+    assert manager._tier_cancelled["r"] == {1}
+    key = object()
+    asyncio.run(
+        manager.async_lookup_and_prefetch(
+            "r", keys=[key], cum_chunk_lengths=[0, 4], epoch=1
+        )
+    )
+    assert backend.gets == 0
+    assert backend.unpinned == []
+    assert manager.async_lookup_server.responses == []
+    assert manager.tier_queue.has_waiting() is False
+    assert "r" not in manager._tier_cancelled
+
+    later = _Backend(1)
+    manager.get_active_storage_backends = lambda search_range=None: [("disk", later)]
+    asyncio.run(
+        manager.async_lookup_and_prefetch(
+            "r", keys=[object()], cum_chunk_lengths=[0, 4], epoch=2
+        )
+    )
+    assert later.gets == 0
+    assert manager.async_lookup_server.responses == [("r", 4, "lookup")]
+    assert manager.tier_queue.has_waiting() is True
 
 
 def test_stale_cleanup_does_not_cancel_a_newer_contains():
