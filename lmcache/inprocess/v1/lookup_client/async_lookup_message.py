@@ -20,6 +20,9 @@ class LookupRequestMsg(AsyncLookupMsg):
     hashes: list[int]
     offsets: list[int]
     request_configs: Optional[Dict[str, str]] = None
+    # Bumped when the scheduler retires a lookup. The worker echoes it so a
+    # response from the previous prefix cannot be applied to the next one.
+    epoch: int = 0
 
     def describe(self) -> str:
         return (
@@ -40,6 +43,7 @@ class LookupResponseMsg(AsyncLookupMsg):
     lookup_id: str
     num_hit_tokens: int
     kind: str = ""
+    epoch: int = 0
 
     def describe(self) -> str:
         return (

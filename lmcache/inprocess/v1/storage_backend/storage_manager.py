@@ -277,7 +277,10 @@ class StorageManager:
         )
         self.async_serializer: Optional[AsyncSerializer] = None
         self.tier_queue = TierWorkerQueue()
-        self._tier_abort: set[str] = set()
+        # lookup_id -> epoch of the attempt that was cancelled.
+        self._tier_abort: dict[str, int] = {}
+        self._tier_open: set[str] = set()
+        self._tier_epoch_inflight: dict[str, int] = {}
         self._tier_drain_task: Optional[asyncio.Task] = None
         self._tier_drain_again = False
 
@@ -574,6 +577,7 @@ class StorageManager:
         cum_chunk_lengths_total: list[int],
         tier_expected_chunks: list[int],
         keys_per_chunk: int = 1,
+        epoch: int = 0,
     ) -> None:
         """
         Callback function when all prefetch tasks
@@ -589,8 +593,7 @@ class StorageManager:
         )
         res = task.result()
         self.tier_queue.finish(lookup_id)
-        if lookup_id in self._tier_abort:
-            self._tier_abort.discard(lookup_id)
+        if self._consume_tier_abort(lookup_id, epoch):
             self._release_prefetch_result(res)
             return
 
@@ -671,12 +674,12 @@ class StorageManager:
         kind = completion_kind(self._split_metadata_lookup_enabled())
         if kind:
             self.async_lookup_server.send_response_to_scheduler(
-                lookup_id, retrieved_length, kind
+                lookup_id, retrieved_length, kind, epoch
             )
             self._schedule_tier_drain()
         else:
             self.async_lookup_server.send_response_to_scheduler(
-                lookup_id, retrieved_length
+                lookup_id, retrieved_length, epoch=epoch
             )
 
     async def async_lookup_and_prefetch(
@@ -687,6 +690,7 @@ class StorageManager:
         search_range: Optional[list[str]] = None,
         pin: bool = False,
         keys_per_chunk: int = 1,
+        epoch: int = 0,
     ) -> None:
         """
         Perform asynchronous lookup and prefetching across all storage backends.
@@ -754,151 +758,173 @@ class StorageManager:
         tier_expected_chunks = []
         # we also keep track of the keys for each tier and each chunk
         loading_task_keys: list[list[CacheEngineKey]] = []
-        defer = self._split_metadata_lookup_enabled()
-        deferred_tiers: list[tuple[Any, list[CacheEngineKey], int, list[int]]] = []
-        for backend_name, backend in self.get_active_storage_backends(
-            search_range=search_range
-        ):
-            num_hit_keys_raw = await backend.batched_async_contains(
-                lookup_id, keys, pin
-            )
-            # Round down to a whole-chunk boundary. If a backend has only
-            # some of a chunk's per-layer keys (e.g., partial eviction),
-            # we treat the chunk as a miss to keep the chunk-level
-            # invariant required by the prefix-match retrieval pattern.
-            num_hit_chunks = num_hit_keys_raw // keys_per_chunk
-            num_hit_keys = num_hit_chunks * keys_per_chunk
+        split = self._split_metadata_lookup_enabled()
+        if split:
+            self._track_tier_lookup(lookup_id, epoch)
+        try:
+            if split and self._abort_matches(lookup_id, epoch):
+                self._consume_tier_abort(lookup_id, epoch)
+                return
+            defer = self._split_metadata_lookup_enabled()
+            deferred_tiers: list[tuple[Any, list[CacheEngineKey], int, list[int]]] = []
+            for backend_name, backend in self.get_active_storage_backends(
+                search_range=search_range
+            ):
+                num_hit_keys_raw = await backend.batched_async_contains(
+                    lookup_id, keys, pin
+                )
+                # Round down to a whole-chunk boundary. If a backend has only
+                # some of a chunk's per-layer keys (e.g., partial eviction),
+                # we treat the chunk as a miss to keep the chunk-level
+                # invariant required by the prefix-match retrieval pattern.
+                num_hit_chunks = num_hit_keys_raw // keys_per_chunk
+                num_hit_keys = num_hit_chunks * keys_per_chunk
 
-            # `pin=True` pins every matching key inside batched_async_contains.
-            # The rounded-off tail (keys[num_hit_keys:num_hit_keys_raw]) is
-            # dropped from backend_keys and never retrieved, so release those
-            # pins here to avoid leaking refcount budget.
-            if pin and num_hit_keys < num_hit_keys_raw:
-                for k in keys[num_hit_keys:num_hit_keys_raw]:
-                    backend.unpin(k)
+                # `pin=True` pins every matching key inside batched_async_contains.
+                # The rounded-off tail (keys[num_hit_keys:num_hit_keys_raw]) is
+                # dropped from backend_keys and never retrieved, so release those
+                # pins here to avoid leaking refcount budget.
+                if pin and num_hit_keys < num_hit_keys_raw:
+                    for k in keys[num_hit_keys:num_hit_keys_raw]:
+                        backend.unpin(k)
 
-            if num_hit_chunks == 0:
-                continue
+                if num_hit_chunks == 0:
+                    continue
 
-            num_total_hit_chunks += num_hit_chunks
-            tier_expected_chunks.append(num_hit_chunks)
+                num_total_hit_chunks += num_hit_chunks
+                tier_expected_chunks.append(num_hit_chunks)
 
-            backend_keys = keys[:num_hit_keys]
-            loading_task_keys.append(backend_keys)
+                backend_keys = keys[:num_hit_keys]
+                loading_task_keys.append(backend_keys)
 
-            if defer:
-                deferred_tiers.append(
-                    (
-                        backend,
+                if defer:
+                    deferred_tiers.append(
+                        (
+                            backend,
+                            backend_keys,
+                            num_hit_chunks,
+                            list(cum_chunk_lengths[: num_hit_chunks + 1]),
+                        )
+                    )
+                    cum_chunk_lengths = cum_chunk_lengths[num_hit_chunks:]
+                    if num_total_hit_chunks == num_total_chunks:
+                        break
+                    keys = keys[num_hit_keys:]
+                    continue
+
+                assert self.async_serializer is not None, (
+                    "Async serializer must be initialized via post_init before using "
+                    "async_lookup_and_prefetch."
+                )
+                # num_hit_chunks is only used for the multi serializer
+                get_coro = self.async_serializer.run(
+                    backend.batched_get_non_blocking(
+                        lookup_id,
                         backend_keys,
-                        num_hit_chunks,
-                        list(cum_chunk_lengths[: num_hit_chunks + 1]),
+                        {"cum_chunk_lengths": cum_chunk_lengths[: num_hit_chunks + 1]},
+                    ),
+                    num_hit_chunks,
+                )
+                loading_task = asyncio.create_task(get_coro)
+                loading_task.add_done_callback(
+                    functools.partial(
+                        self.prefetch_single_done_callback,
+                        keys=keys,
+                        backend_name=backend_name,
                     )
                 )
+
+                loading_tasks.append(loading_task)
+
                 cum_chunk_lengths = cum_chunk_lengths[num_hit_chunks:]
+
                 if num_total_hit_chunks == num_total_chunks:
                     break
                 keys = keys[num_hit_keys:]
-                continue
 
-            assert self.async_serializer is not None, (
-                "Async serializer must be initialized via post_init before using "
-                "async_lookup_and_prefetch."
-            )
-            # num_hit_chunks is only used for the multi serializer
-            get_coro = self.async_serializer.run(
-                backend.batched_get_non_blocking(
-                    lookup_id,
-                    backend_keys,
-                    {"cum_chunk_lengths": cum_chunk_lengths[: num_hit_chunks + 1]},
-                ),
-                num_hit_chunks,
-            )
-            loading_task = asyncio.create_task(get_coro)
-            loading_task.add_done_callback(
-                functools.partial(
-                    self.prefetch_single_done_callback,
-                    keys=keys,
-                    backend_name=backend_name,
+            if defer:
+                if self._abort_matches(lookup_id, epoch):
+                    # The scheduler cancelled while contains was still running.
+                    # Drop the pins and do not queue a GET.
+                    self._unpin_deferred(deferred_tiers)
+                    self._consume_tier_abort(lookup_id, epoch)
+                    return
+                hit_tokens = (
+                    cum_chunk_lengths_total[num_total_hit_chunks]
+                    if num_total_hit_chunks
+                    else 0
                 )
-            )
-
-            loading_tasks.append(loading_task)
-
-            cum_chunk_lengths = cum_chunk_lengths[num_hit_chunks:]
-
-            if num_total_hit_chunks == num_total_chunks:
-                break
-            keys = keys[num_hit_keys:]
-
-        if defer:
-            hit_tokens = (
-                cum_chunk_lengths_total[num_total_hit_chunks]
-                if num_total_hit_chunks
-                else 0
-            )
-            # Metadata only. A miss does not start a GET.
-            self._send_tier_ack(lookup_id, hit_tokens, "lookup")
-            if hit_tokens <= 0:
-                self.tier_queue.note_lookup(lookup_id, 0, None)
+                # Metadata only. A miss does not start a GET.
+                self._send_tier_ack(lookup_id, hit_tokens, "lookup", epoch)
+                if hit_tokens <= 0:
+                    self.tier_queue.note_lookup(lookup_id, 0, None)
+                    return
+                load = TierLoad(
+                    num_chunks=num_total_hit_chunks,
+                    tiers=deferred_tiers,
+                    cum_chunk_lengths_total=cum_chunk_lengths_total,
+                    tier_expected_chunks=list(tier_expected_chunks),
+                    keys_per_chunk=keys_per_chunk,
+                    epoch=epoch,
+                )
+                accepted, replaced = self.tier_queue.note_lookup(
+                    lookup_id, hit_tokens, load
+                )
+                if replaced is not None:
+                    self._unpin_tier_load(replaced)
+                if accepted:
+                    self._schedule_tier_drain()
                 return
-            load = TierLoad(
-                num_chunks=num_total_hit_chunks,
-                tiers=deferred_tiers,
-                cum_chunk_lengths_total=cum_chunk_lengths_total,
-                tier_expected_chunks=list(tier_expected_chunks),
-                keys_per_chunk=keys_per_chunk,
-            )
-            accepted, replaced = self.tier_queue.note_lookup(
-                lookup_id, hit_tokens, load
-            )
-            if replaced is not None:
-                self._unpin_tier_load(replaced)
-            if accepted:
-                self._schedule_tier_drain()
-            return
 
-        # If no chunks were hit across all backends, respond immediately and return.
-        if num_total_hit_chunks == 0:
-            if self.async_lookup_server is not None:
-                self.async_lookup_server.send_response_to_scheduler(lookup_id, 0)
-            return
+            # If no chunks were hit across all backends, respond immediately and return.
+            if num_total_hit_chunks == 0:
+                if self.async_lookup_server is not None:
+                    self.async_lookup_server.send_response_to_scheduler(
+                        lookup_id, 0, epoch=epoch
+                    )
+                return
 
-        # gather_with_keys() here make a pair of (key, memory_obj) for each chunk
-        # in each tier. The all_done result's layout is like following and
-        # will be processed in _async_process_tokens_internal()
-        # Tier 0:
-        #  Tuple(loading_task_keys[0][0] : MemoryObj0)
-        #  Tuple(loading_task_keys[0][1] : MemoryObj1)
-        # Tier 1:
-        #  Tuple(loading_task_keys[1][0] : MemoryObj2)
-        #  Tuple(loading_task_keys[1][1] : MemoryObj3)
-        async def gather_with_keys() -> list[list[tuple[CacheEngineKey, MemoryObj]]]:
-            loading_results = await asyncio.gather(*loading_tasks)
-            return [
-                list(zip(keys, results, strict=False))
-                for keys, results in zip(
-                    loading_task_keys, loading_results, strict=False
-                )
-            ]
+            # gather_with_keys() here make a pair of (key, memory_obj) for each chunk
+            # in each tier. The all_done result's layout is like following and
+            # will be processed in _async_process_tokens_internal()
+            # Tier 0:
+            #  Tuple(loading_task_keys[0][0] : MemoryObj0)
+            #  Tuple(loading_task_keys[0][1] : MemoryObj1)
+            # Tier 1:
+            #  Tuple(loading_task_keys[1][0] : MemoryObj2)
+            #  Tuple(loading_task_keys[1][1] : MemoryObj3)
+            async def gather_with_keys() -> list[
+                list[tuple[CacheEngineKey, MemoryObj]]
+            ]:
+                loading_results = await asyncio.gather(*loading_tasks)
+                return [
+                    list(zip(keys, results, strict=False))
+                    for keys, results in zip(
+                        loading_task_keys, loading_results, strict=False
+                    )
+                ]
 
-        all_done = asyncio.create_task(gather_with_keys())
-        # Register the event before adding the callback to avoid race conditions
-        self.event_manager.add_event(
-            EventType.LOADING,
-            lookup_id,
-            all_done,
-        )
-
-        all_done.add_done_callback(
-            lambda future: self.prefetch_all_done_callback(
-                future,
+            all_done = asyncio.create_task(gather_with_keys())
+            # Register the event before adding the callback to avoid race conditions
+            self.event_manager.add_event(
+                EventType.LOADING,
                 lookup_id,
-                cum_chunk_lengths_total,
-                tier_expected_chunks,
-                keys_per_chunk=keys_per_chunk,
+                all_done,
             )
-        )
+
+            all_done.add_done_callback(
+                lambda future: self.prefetch_all_done_callback(
+                    future,
+                    lookup_id,
+                    cum_chunk_lengths_total,
+                    tier_expected_chunks,
+                    keys_per_chunk=keys_per_chunk,
+                    epoch=epoch,
+                )
+            )
+        finally:
+            if split:
+                self._tier_open.discard(lookup_id)
 
     def _split_metadata_lookup_enabled(self) -> bool:
         cfg = getattr(self, "config", None)
@@ -908,7 +934,9 @@ class StorageManager:
             getattr(cfg, "enable_async_loading", False)
         )
 
-    def _send_tier_ack(self, lookup_id: str, num_hit_tokens: int, kind: str) -> None:
+    def _send_tier_ack(
+        self, lookup_id: str, num_hit_tokens: int, kind: str, epoch: int = 0
+    ) -> None:
         if self.async_lookup_server is None:
             return
         logger.info(
@@ -918,7 +946,7 @@ class StorageManager:
             kind,
         )
         self.async_lookup_server.send_response_to_scheduler(
-            lookup_id, num_hit_tokens, kind
+            lookup_id, num_hit_tokens, kind, int(epoch)
         )
 
     def _host_free_bytes(self) -> Optional[int]:
@@ -1009,13 +1037,13 @@ class StorageManager:
                 if item is None:
                     break
                 lookup_id, load = item
-                if lookup_id in self._tier_abort:
-                    self._tier_abort.discard(lookup_id)
+                if self._abort_matches(lookup_id, load.epoch):
+                    self._consume_tier_abort(lookup_id, load.epoch)
                     self.tier_queue.finish(lookup_id)
                     self._unpin_tier_load(load)
                     continue
                 reserved += self._prefix_bytes(load)
-                self._send_tier_ack(lookup_id, 0, "reading")
+                self._send_tier_ack(lookup_id, 0, "reading", load.epoch)
                 self._launch_tier_get(lookup_id, load)
                 started = True
             if not started or not self._tier_drain_again:
@@ -1024,6 +1052,11 @@ class StorageManager:
             self._tier_drain_again = False
 
     def _launch_tier_get(self, lookup_id: str, load: TierLoad) -> None:
+        if self._abort_matches(lookup_id, load.epoch):
+            self._consume_tier_abort(lookup_id, load.epoch)
+            self.tier_queue.finish(lookup_id)
+            self._unpin_tier_load(load)
+            return
         assert self.async_serializer is not None, (
             "Async serializer must be initialized via post_init before using "
             "async_lookup_and_prefetch."
@@ -1060,25 +1093,87 @@ class StorageManager:
                 load.cum_chunk_lengths_total,
                 load.tier_expected_chunks,
                 keys_per_chunk=load.keys_per_chunk,
+                epoch=load.epoch,
             )
         )
+
+    def note_tier_lookup_started(self, lookup_id: str, epoch: int = 0) -> None:
+        """Record that a lookup is open before its coroutine is scheduled.
+
+        The worker handles the later cancel message on the same thread, so the
+        id is visible to ``abort_tier_load`` even if contains has not returned.
+        """
+        if not self._split_metadata_lookup_enabled():
+            return
+        self._track_tier_lookup(lookup_id, int(epoch))
 
     def abort_tier_load(self, lookup_id: str) -> bool:
         """Drop a queued GET. A GET already running is released when it finishes.
 
-        Returns True when the body read had not started. A storage manager that
-        never built the tier queue leaves cleanup to the caller.
+        A lookup whose metadata contains is still running is recorded and
+        returns True. That coroutine unpins and does not start a GET. A storage
+        manager that never built the tier queue leaves cleanup to the caller.
+        An id that is neither open nor queued returns False so a finished
+        prefetch is still released.
         """
         queue = getattr(self, "tier_queue", None)
         if queue is None:
             return False
+        epoch = int(self._tier_epoch_inflight.get(lookup_id, 0))
         job = queue.drop_if_waiting(lookup_id)
         if job is not None:
             self._unpin_tier_load(job)
+            self._tier_abort.pop(lookup_id, None)
             return True
         if queue.is_reading(lookup_id):
-            self._tier_abort.add(lookup_id)
+            reading = queue.reading_epoch(lookup_id)
+            self._tier_abort[lookup_id] = epoch if reading is None else reading
+            return False
+        if lookup_id in self._tier_open:
+            self._tier_abort[lookup_id] = epoch
+            return True
+        self._tier_abort.pop(lookup_id, None)
         return False
+
+    def _track_tier_lookup(self, lookup_id: str, epoch: int) -> None:
+        if lookup_id not in self._tier_open:
+            stale = self._tier_abort.get(lookup_id)
+            reading = None
+            queue = getattr(self, "tier_queue", None)
+            if queue is not None:
+                reading_epoch = getattr(queue, "reading_epoch", None)
+                if callable(reading_epoch):
+                    reading = reading_epoch(lookup_id)
+            if stale is not None and stale != epoch and stale != reading:
+                self._tier_abort.pop(lookup_id, None)
+        self._tier_epoch_inflight[lookup_id] = epoch
+        self._tier_open.add(lookup_id)
+
+    def _abort_matches(self, lookup_id: str, epoch: int) -> bool:
+        aborted = getattr(self, "_tier_abort", None)
+        if not aborted or lookup_id not in aborted:
+            return False
+        if isinstance(aborted, dict):
+            return aborted.get(lookup_id) == int(epoch)
+        return True
+
+    def _consume_tier_abort(self, lookup_id: str, epoch: int) -> bool:
+        if not self._abort_matches(lookup_id, epoch):
+            return False
+        aborted = self._tier_abort
+        if isinstance(aborted, dict):
+            aborted.pop(lookup_id, None)
+        else:
+            aborted.discard(lookup_id)
+        return True
+
+    def _unpin_deferred(self, tiers) -> None:
+        for backend, keys, _num_hit_chunks, _cum in tiers:
+            unpin = getattr(backend, "unpin", None)
+            if not callable(unpin):
+                continue
+            for key in keys:
+                unpin(key)
 
     def _unpin_tier_load(self, load: TierLoad) -> None:
         for backend, keys, _num_hit_chunks, _cum in load.tiers:

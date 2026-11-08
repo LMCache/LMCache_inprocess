@@ -160,6 +160,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         # None keeps the legacy one-response path. Set only when the split is on.
         self.tier_admission: Optional[TierAdmission] = None
         self._tier_parts: dict[tuple[str, str], list[int]] = {}
+        self._tier_epoch: dict[str, int] = {}
         if bool(getattr(config, "split_metadata_lookup", False)) and bool(
             getattr(config, "enable_async_loading", False)
         ):
@@ -212,8 +213,12 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         Unlike ``lookup``, this does not sleep. The scheduler calls it while
         walking the waiting queue.
         """
-        if self.tier_admission is not None and not self.tier_admission.offer(lookup_id):
-            return False
+        epoch = 0
+        if self.tier_admission is not None:
+            if not self.tier_admission.offer(lookup_id):
+                return False
+            epoch = self.tier_admission.generation(lookup_id)
+            self._tier_epoch[lookup_id] = epoch
 
         hashes: list[int] = []
         offsets = []
@@ -228,6 +233,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
             hashes=hashes,
             offsets=offsets,
             request_configs=request_configs,
+            epoch=epoch,
         )
         msg_buf = msgspec.msgpack.encode(msg)
         for i in range(self.world_size):
@@ -256,6 +262,11 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         if self.tier_admission is None:
             return 0
         return self.tier_admission.preloaded_tokens(lookup_id)
+
+    def lookup_offered_at(self, lookup_id: str) -> Optional[float]:
+        if self.tier_admission is None:
+            return None
+        return self.tier_admission.offered_at(lookup_id)
 
     def process_responses_from_workers(self):
         while self.running:
@@ -296,6 +307,9 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         """Fold one worker ACK into the scheduler phase. Min across TP ranks."""
         if self.tier_admission is None:
             return
+        expected = int(self._tier_epoch.get(msg.lookup_id, 0))
+        if int(getattr(msg, "epoch", 0)) != expected:
+            return
         key = (msg.lookup_id, msg.kind)
         with self.lock:
             bucket = self._tier_parts.setdefault(key, [])
@@ -316,6 +330,25 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
             }
         if self.tier_admission is not None:
             self.tier_admission.clear(lookup_id)
+
+    def retire_lookup(self, lookup_id: str) -> None:
+        """Drop a lookup so another one can be offered. Does not mark a miss.
+
+        The worker is told to release anything this attempt pinned. The
+        generation bump makes a response from this attempt fail the epoch
+        check.
+        """
+        if self.tier_admission is None:
+            return
+        self.tier_admission.retire(lookup_id)
+        self._tier_epoch.pop(lookup_id, None)
+        with self.lock:
+            self._tier_parts = {
+                key: value
+                for key, value in self._tier_parts.items()
+                if key[0] != lookup_id
+            }
+        self._send_cleanup_message(lookup_id)
 
     def cancel_lookup(self, lookup_id: str) -> None:
         """Mark lookup as aborted. Cleanup will happen after task finishes.
@@ -446,6 +479,7 @@ class LMCacheAsyncLookupServer:
                         offsets=msg.offsets,
                         pin=True,
                         request_configs=msg.request_configs,
+                        epoch=int(getattr(msg, "epoch", 0)),
                     )
 
                 elif isinstance(msg, LookupCleanupMsg):
@@ -459,13 +493,14 @@ class LMCacheAsyncLookupServer:
                 logger.error("Error processing request from scheduler: %s", e)
 
     def send_response_to_scheduler(
-        self, lookup_id: str, num_hit_tokens: int, kind: str = ""
+        self, lookup_id: str, num_hit_tokens: int, kind: str = "", epoch: int = 0
     ):
         # Create structured response message. Empty kind is the legacy ACK.
         msg = LookupResponseMsg(
             lookup_id=lookup_id,
             num_hit_tokens=num_hit_tokens,
             kind=kind,
+            epoch=int(epoch),
         )
 
         # Serialize message using msgspec

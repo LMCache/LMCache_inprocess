@@ -1351,6 +1351,7 @@ class LMCacheEngine:
         search_range: Optional[List[str]] = None,
         pin: bool = False,
         request_configs: Optional[dict] = None,
+        epoch: int = 0,
     ) -> None:
         """
         An async version of lookup + prefetch.
@@ -1361,6 +1362,9 @@ class LMCacheEngine:
         (3) async lookup + async retrieval (e.g., p2p)
         """
         assert self.storage_manager is not None
+        started = getattr(self.storage_manager, "note_tier_lookup_started", None)
+        if callable(started):
+            started(lookup_id, int(epoch))
 
         keys: list[CacheEngineKey] = []
         cum_chunk_lengths = [0]
@@ -1396,6 +1400,7 @@ class LMCacheEngine:
                 search_range,
                 pin,
                 keys_per_chunk=keys_per_chunk,
+                epoch=int(epoch),
             ),
             self.storage_manager.loop,
         )

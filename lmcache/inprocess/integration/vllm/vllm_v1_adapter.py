@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import math
 import os
 import sys
+import time
 
 # Third Party
 from vllm.config import (
@@ -48,6 +49,7 @@ from lmcache.inprocess.v1.config_base import validate_and_set_config_value
 from lmcache.inprocess.v1.manager import LMCacheManager
 from lmcache.inprocess.v1.tier_pipeline import (
     admission_tokens,
+    metadata_lookup_expired,
     offer_waiting_lookups,
 )
 from lmcache.logging import init_logger
@@ -1487,6 +1489,18 @@ class LMCacheConnectorV1Impl:
         if self._split_metadata_lookup_enabled():
             # Lookup was offered when the request entered the waiting queue.
             # This call only reads that result. Pending is not a miss.
+            # A metadata ACK that never arrives becomes a miss. A hit that is
+            # still waiting for host memory stays None.
+            phase = self.lookup_client.lookup_phase(req_id)
+            offered_at = self.lookup_client.lookup_offered_at(req_id)
+            if metadata_lookup_expired(
+                phase,
+                offered_at,
+                getattr(self.config, "lookup_timeout_ms", 0),
+                time.monotonic(),
+            ):
+                self.lookup_client.cancel_lookup(req_id)
+                return 0
             admitted = admission_tokens(
                 self.lookup_client.lookup_phase(req_id),
                 self.lookup_client.preloaded_tokens(req_id),
