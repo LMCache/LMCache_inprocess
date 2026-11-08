@@ -456,8 +456,10 @@ class DummyLMCacheAsyncLookupServer:
         self,
         lookup_id: str,
         retrieved_length: int,
+        kind: str = "",
+        epoch: int = 0,
     ) -> None:
-        pass
+        del lookup_id, retrieved_length, kind, epoch
 
 
 class MockAdapter:
