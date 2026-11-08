@@ -16,6 +16,7 @@ A miss does not start a GET. A prefix that does not fit in host stays queued.
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 import threading
+import time
 
 STATUS_INIT = "INIT"
 STATUS_READING = "READING"
@@ -23,6 +24,7 @@ STATUS_MISS = "MISS"
 
 PHASE_ABSENT = "absent"
 PHASE_PENDING = "pending"
+PHASE_QUEUED = "queued"
 PHASE_MISS = "miss"
 PHASE_READY = "ready"
 
@@ -30,17 +32,40 @@ PHASE_READY = "ready"
 def admission_tokens(phase: str, preloaded: int) -> Optional[int]:
     """What ``get_num_new_matched_tokens`` may report. It does not start I/O.
 
-    Pending and absent stay ``None`` so vLLM leaves the request in
-    ``skipped_waiting``. A confirmed miss is ``0``. A positive length is
-    returned only after the body is in host memory.
+    Pending, queued, and absent stay ``None`` so vLLM leaves the request in
+    ``skipped_waiting``. Queued means the hit length is known and the body is
+    not in host yet; that wait is not a miss. A confirmed miss is ``0``. A
+    positive length is returned only after the body is in host memory.
     """
-    if phase in (PHASE_ABSENT, PHASE_PENDING):
+    if phase in (PHASE_ABSENT, PHASE_PENDING, PHASE_QUEUED):
         return None
     if phase == PHASE_MISS:
         return 0
     if phase == PHASE_READY:
         return max(0, int(preloaded))
     return None
+
+
+def metadata_lookup_expired(
+    phase: str,
+    offered_at: Optional[float],
+    timeout_ms: Any,
+    now: float,
+) -> bool:
+    """True when a metadata lookup has had no ACK within ``timeout_ms``.
+
+    A queued hit that is waiting for host memory does not expire. ``timeout_ms``
+    is the existing ``lookup_timeout_ms`` setting.
+    """
+    if phase != PHASE_PENDING or offered_at is None:
+        return False
+    try:
+        limit = float(timeout_ms)
+    except (TypeError, ValueError):
+        return False
+    if limit <= 0:
+        return False
+    return (float(now) - float(offered_at)) * 1000 > limit
 
 
 def completion_kind(split_enabled: bool) -> str:
@@ -57,6 +82,7 @@ class TierLoad:
     cum_chunk_lengths_total: list[int]
     tier_expected_chunks: list[int]
     keys_per_chunk: int
+    epoch: int = 0
 
 
 class TierWorkerQueue:
@@ -129,6 +155,13 @@ class TierWorkerQueue:
             current = self._entries.get(str(req_id))
             return current is not None and current[0] == STATUS_READING
 
+    def reading_epoch(self, req_id: str) -> Optional[int]:
+        with self._lock:
+            current = self._entries.get(str(req_id))
+            if current is None or current[0] != STATUS_READING or current[1] is None:
+                return None
+            return int(current[1].epoch)
+
     def finish(self, req_id: str) -> None:
         """Forget a GET that has completed or been discarded."""
         key = str(req_id)
@@ -148,6 +181,8 @@ class TierAdmission:
         self._phase: dict[str, str] = {}
         self._preloaded: dict[str, int] = {}
         self._order: list[str] = []
+        self._generation: dict[str, int] = {}
+        self._offered_at: dict[str, float] = {}
 
     def offer(self, req_id: str) -> bool:
         """Mark a new lookup pending. False if this id is already tracked."""
@@ -156,9 +191,20 @@ class TierAdmission:
             phase = self._phase.get(key, PHASE_ABSENT)
             if phase != PHASE_ABSENT:
                 return False
+            self._generation[key] = self._generation.get(key, 0) + 1
             self._phase[key] = PHASE_PENDING
+            self._offered_at[key] = time.monotonic()
             self._order.append(key)
             return True
+
+    def generation(self, req_id: str) -> int:
+        """Monotonic id of the lookup currently offered for this request."""
+        with self._lock:
+            return int(self._generation.get(str(req_id), 0))
+
+    def offered_at(self, req_id: str) -> Optional[float]:
+        with self._lock:
+            return self._offered_at.get(str(req_id))
 
     def note(self, req_id: str, kind: str, tokens: int) -> None:
         """Apply one worker ACK. A later ACK does not revive a miss or a hit."""
@@ -172,8 +218,13 @@ class TierAdmission:
             if kind == "lookup":
                 if tokens <= 0:
                     self._phase[key] = PHASE_MISS
+                    self._offered_at.pop(key, None)
+                elif phase == PHASE_PENDING:
+                    self._phase[key] = PHASE_QUEUED
+                    self._offered_at.pop(key, None)
                 return
             if kind in ("preloaded", ""):
+                self._offered_at.pop(key, None)
                 if tokens <= 0:
                     self._phase[key] = PHASE_MISS
                 else:
@@ -189,15 +240,32 @@ class TierAdmission:
             return int(self._preloaded.get(str(req_id), 0))
 
     def inflight(self) -> int:
+        """Lookups that have been sent and have not received a metadata ACK."""
         with self._lock:
             return sum(1 for phase in self._phase.values() if phase == PHASE_PENDING)
 
     def clear(self, req_id: str) -> None:
         key = str(req_id)
         with self._lock:
-            self._phase.pop(key, None)
-            self._preloaded.pop(key, None)
-            self._order = [item for item in self._order if item != key]
+            self._forget_locked(key)
+
+    def retire(self, req_id: str) -> int:
+        """Drop the phase and bump the generation so a late ACK cannot apply.
+
+        The id is absent afterwards, so a new offer can start. The generation
+        is not reset.
+        """
+        key = str(req_id)
+        with self._lock:
+            self._generation[key] = self._generation.get(key, 0) + 1
+            self._forget_locked(key)
+            return self._generation[key]
+
+    def _forget_locked(self, key: str) -> None:
+        self._phase.pop(key, None)
+        self._preloaded.pop(key, None)
+        self._offered_at.pop(key, None)
+        self._order = [item for item in self._order if item != key]
 
 
 def offer_waiting_lookups(
@@ -239,14 +307,18 @@ def offer_waiting_lookups(
             preempt_n = int(getattr(request, "num_preemptions", 0) or 0)
             seen = int(preempt_seen.get(req_id, 0) or 0)
             phase = str(admission.phase(req_id))
-            if preempt_n > seen and phase in (PHASE_READY, PHASE_MISS):
-                admission.clear(req_id)
+            if preempt_n > seen and phase != PHASE_ABSENT:
+                # The old prefix must not finish. retire bumps the generation
+                # and leaves the id absent so this pass can offer again.
+                retire = getattr(client, "retire_lookup", None)
+                if callable(retire):
+                    retire(req_id)
+                else:
+                    admission.retire(req_id)
                 phase = PHASE_ABSENT
             if preempt_n > seen:
                 preempt_seen[req_id] = preempt_n
-            if phase == PHASE_PENDING:
-                continue
-            if phase in (PHASE_READY, PHASE_MISS):
+            if phase in (PHASE_PENDING, PHASE_QUEUED, PHASE_READY, PHASE_MISS):
                 continue
             prepared = prepare_tokens(request)
             if prepared is None:

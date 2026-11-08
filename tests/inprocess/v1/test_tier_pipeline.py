@@ -15,12 +15,14 @@ from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.tier_pipeline import (
     PHASE_MISS,
     PHASE_PENDING,
+    PHASE_QUEUED,
     PHASE_READY,
     TierAdmission,
     TierLoad,
     TierWorkerQueue,
     admission_tokens,
     completion_kind,
+    metadata_lookup_expired,
     offer_waiting_lookups,
 )
 
@@ -64,22 +66,19 @@ def test_admission_pending_is_not_a_miss_and_ready_is_positive():
     assert admission.phase("r") == PHASE_PENDING
     assert admission_tokens(admission.phase("r"), 0) is None
 
-    # Metadata hit only. HBM admission still waits.
+    # Metadata hit only. The lookup window is free, HBM admission still waits.
     admission.note("r", "lookup", 128)
-    assert admission.phase("r") == PHASE_PENDING
-    tokens = admission_tokens(
-        admission.phase("r"), admission.preloaded_tokens("r")
-    )
+    assert admission.phase("r") == PHASE_QUEUED
+    assert admission.inflight() == 0
+    tokens = admission_tokens(admission.phase("r"), admission.preloaded_tokens("r"))
     assert tokens is None
 
     admission.note("r", "reading", 0)
-    assert admission.phase("r") == PHASE_PENDING
+    assert admission.phase("r") == PHASE_QUEUED
 
     admission.note("r", "preloaded", 128)
     assert admission.phase("r") == PHASE_READY
-    tokens = admission_tokens(
-        admission.phase("r"), admission.preloaded_tokens("r")
-    )
+    tokens = admission_tokens(admission.phase("r"), admission.preloaded_tokens("r"))
     assert tokens == 128
 
     # A later ACK does not change a finished hit.
@@ -147,6 +146,7 @@ class _Client:
     def __init__(self):
         self.tier_admission = TierAdmission()
         self.sent: list[str] = []
+        self.retired: list[str] = []
 
     def submit_lookup(self, token_ids, lookup_id, request_configs=None):
         del token_ids, request_configs
@@ -154,6 +154,10 @@ class _Client:
             return False
         self.sent.append(lookup_id)
         return True
+
+    def retire_lookup(self, lookup_id):
+        self.tier_admission.retire(lookup_id)
+        self.retired.append(lookup_id)
 
 
 def test_offer_starts_lookup_before_hbm_and_does_not_pop_the_queue():
@@ -178,6 +182,7 @@ def test_offer_starts_lookup_before_hbm_and_does_not_pop_the_queue():
 
 def _storage_manager_cls():
     pytest.importorskip("lmcache.lmcache_native")
+    # First Party
     from lmcache.inprocess.v1.storage_backend.storage_manager import (
         StorageManager,
     )
@@ -187,21 +192,20 @@ def _storage_manager_cls():
 
 def test_split_flag_requires_async_loading():
     storage_manager = _storage_manager_cls()
-    enabled = SimpleNamespace(
-        split_metadata_lookup=True, enable_async_loading=True
+
+    def enabled_for(cfg) -> bool:
+        manager = storage_manager.__new__(storage_manager)
+        manager.config = cfg
+        return manager._split_metadata_lookup_enabled()
+
+    assert enabled_for(
+        SimpleNamespace(split_metadata_lookup=True, enable_async_loading=True)
     )
-    sync_only = SimpleNamespace(
-        split_metadata_lookup=True, enable_async_loading=False
+    assert not enabled_for(
+        SimpleNamespace(split_metadata_lookup=True, enable_async_loading=False)
     )
-    off = SimpleNamespace(split_metadata_lookup=False, enable_async_loading=True)
-    assert storage_manager._split_metadata_lookup_enabled(
-        SimpleNamespace(config=enabled)
-    )
-    assert not storage_manager._split_metadata_lookup_enabled(
-        SimpleNamespace(config=sync_only)
-    )
-    assert not storage_manager._split_metadata_lookup_enabled(
-        SimpleNamespace(config=off)
+    assert not enabled_for(
+        SimpleNamespace(split_metadata_lookup=False, enable_async_loading=True)
     )
 
 
@@ -228,7 +232,8 @@ class _Ack:
     def __init__(self):
         self.responses = []
 
-    def send_response_to_scheduler(self, lookup_id, num_hit_tokens, kind=""):
+    def send_response_to_scheduler(self, lookup_id, num_hit_tokens, kind="", epoch=0):
+        del epoch
         self.responses.append((lookup_id, num_hit_tokens, kind))
 
 
@@ -241,7 +246,9 @@ def _manager(split: bool, backend: _Backend):
     )
     manager.tier_queue = TierWorkerQueue()
     manager.async_lookup_server = _Ack()
-    manager._tier_abort = set()
+    manager._tier_abort = {}
+    manager._tier_open = set()
+    manager._tier_epoch_inflight = {}
     manager.loop = SimpleNamespace(is_running=lambda: False)
     manager.get_active_storage_backends = lambda search_range=None: [("disk", backend)]
     return manager
@@ -288,3 +295,97 @@ def test_flag_on_hit_stays_queued_until_it_fits():
     assert claimed is not None
     assert claimed[0] == "r"
     assert claimed[1].num_chunks == 2
+
+
+def test_preempt_cancels_pending_and_offers_again():
+    waiting = [_Request("a", [1, 2])]
+    scheduler = SimpleNamespace(
+        waiting=waiting, skipped_waiting=[], scheduler_config=None
+    )
+    client = _Client()
+    seen: dict[str, int] = {}
+
+    def prepare(request):
+        return list(request.all_token_ids), None
+
+    offer_waiting_lookups(scheduler, client, prepare, window=2, preempt_seen=seen)
+    assert client.sent == ["a"]
+    first = client.tier_admission.generation("a")
+    assert client.tier_admission.phase("a") == PHASE_PENDING
+
+    waiting[0].num_preemptions = 1
+    waiting[0].all_token_ids = [9, 9]
+    offer_waiting_lookups(scheduler, client, prepare, window=2, preempt_seen=seen)
+    assert client.retired == ["a"]
+    assert client.sent == ["a", "a"]
+    assert client.tier_admission.phase("a") == PHASE_PENDING
+    assert client.tier_admission.generation("a") != first
+    assert client.tier_admission.inflight() == 1
+
+
+def test_retired_generation_does_not_take_the_old_ack():
+    admission = TierAdmission()
+    assert admission.offer("r") is True
+    first = admission.generation("r")
+    admission.retire("r")
+    assert admission.phase("r") == "absent"
+    assert admission.offer("r") is True
+    assert admission.generation("r") != first
+    # The client drops an ACK whose epoch is not the current generation.
+    # Applying it would mark the new lookup ready from the old prefix.
+    if first == admission.generation("r"):
+        admission.note("r", "preloaded", 128)
+    assert admission.phase("r") == PHASE_PENDING
+    assert admission_tokens(admission.phase("r"), 0) is None
+
+
+def test_only_pending_metadata_expires():
+    admission = TierAdmission()
+    admission.offer("pending")
+    offered = admission.offered_at("pending")
+    assert offered is not None
+    assert metadata_lookup_expired(PHASE_PENDING, offered, 10, offered + 0.02)
+    assert not metadata_lookup_expired(PHASE_PENDING, offered, 10, offered)
+    # What cancel_lookup does after the scheduler decides the lookup timed out.
+    admission.note("pending", "lookup", 0)
+    assert admission.phase("pending") == PHASE_MISS
+    assert admission_tokens(admission.phase("pending"), 0) == 0
+
+    admission.offer("queued")
+    admission.note("queued", "lookup", 64)
+    assert admission.phase("queued") == PHASE_QUEUED
+    assert admission.inflight() == 0
+    assert not metadata_lookup_expired(
+        admission.phase("queued"), admission.offered_at("queued"), 1, offered + 100
+    )
+    assert admission_tokens(admission.phase("queued"), 0) is None
+
+
+class _AbortBackend(_Backend):
+    def __init__(self, manager_holder: dict):
+        super().__init__(2)
+        self.manager_holder = manager_holder
+
+    async def batched_async_contains(self, lookup_id, keys, pin):
+        manager = self.manager_holder["manager"]
+        assert manager.abort_tier_load(lookup_id) is True
+        return await super().batched_async_contains(lookup_id, keys, pin)
+
+
+def test_abort_during_contains_does_not_get():
+    holder: dict = {}
+    backend = _AbortBackend(holder)
+    manager = _manager(True, backend)
+    holder["manager"] = manager
+    manager.note_tier_lookup_started("r", 1)
+    keys = [object(), object()]
+    asyncio.run(
+        manager.async_lookup_and_prefetch(
+            "r", keys=keys, cum_chunk_lengths=[0, 4, 8], epoch=1
+        )
+    )
+    assert backend.gets == 0
+    assert backend.unpinned == keys
+    assert manager.tier_queue.has_waiting() is False
+    assert manager.async_lookup_server.responses == []
+    assert manager._tier_abort == {}
