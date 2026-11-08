@@ -313,6 +313,48 @@ def forget_preempt(preempt_seen: dict[str, int], req_id: str) -> None:
     preempt_seen.pop(str(req_id), None)
 
 
+def install_tier_schedule_bridge(scheduler_cls: Any, impl: Any) -> None:
+    """Wrap ``scheduler_cls.schedule`` so each registered impl sees the pass.
+
+    A second install only adds ``impl``. The original method stays on the
+    wrapper until the last impl is detached.
+    """
+    impls = getattr(scheduler_cls, "_lmcache_tier_impls", None)
+    if impls is None:
+        impls = []
+        scheduler_cls._lmcache_tier_impls = impls
+    if impl not in impls:
+        impls.append(impl)
+    schedule = scheduler_cls.schedule
+    if getattr(schedule, "_lmcache_tier_bridge", False):
+        return
+
+    def wrapped(scheduler, *args, **kwargs):
+        for item in list(getattr(scheduler_cls, "_lmcache_tier_impls", ())):
+            bridge = getattr(item, "on_vllm_schedule", None)
+            if callable(bridge):
+                bridge(scheduler)
+        return schedule(scheduler, *args, **kwargs)
+
+    wrapped._lmcache_tier_bridge = True  # type: ignore[attr-defined]
+    wrapped._lmcache_tier_original = schedule  # type: ignore[attr-defined]
+    scheduler_cls.schedule = wrapped
+
+
+def detach_tier_schedule_bridge(scheduler_cls: Any, impl: Any) -> None:
+    """Drop ``impl``. Restore the original schedule when it was the last one."""
+    impls = getattr(scheduler_cls, "_lmcache_tier_impls", None)
+    if not isinstance(impls, list) or impl not in impls:
+        return
+    impls.remove(impl)
+    if impls:
+        return
+    schedule = getattr(scheduler_cls, "schedule", None)
+    original = getattr(schedule, "_lmcache_tier_original", None)
+    if callable(original):
+        scheduler_cls.schedule = original
+
+
 def offer_waiting_lookups(
     scheduler: Any,
     client: Any,

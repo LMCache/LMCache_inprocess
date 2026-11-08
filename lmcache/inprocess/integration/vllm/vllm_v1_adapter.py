@@ -49,7 +49,9 @@ from lmcache.inprocess.v1.config_base import validate_and_set_config_value
 from lmcache.inprocess.v1.manager import LMCacheManager
 from lmcache.inprocess.v1.tier_pipeline import (
     admission_tokens,
+    detach_tier_schedule_bridge,
     forget_preempt,
+    install_tier_schedule_bridge,
     metadata_lookup_expired,
     offer_waiting_lookups,
 )
@@ -1362,6 +1364,7 @@ class LMCacheConnectorV1Impl:
     def shutdown(self):
         """Shutdown the connector by delegating to LMCacheManager."""
         logger.info("Starting LMCacheConnector shutdown...")
+        self._detach_tier_schedule_bridge()
         self._manager.stop_services()
 
     def _split_metadata_lookup_enabled(self) -> bool:
@@ -1380,25 +1383,16 @@ class LMCacheConnectorV1Impl:
         # Third Party
         from vllm.v1.core.sched.scheduler import Scheduler
 
-        impls = getattr(Scheduler, "_lmcache_tier_impls", None)
-        if impls is None:
-            impls = []
-            Scheduler._lmcache_tier_impls = impls
-        if self not in impls:
-            impls.append(self)
-        if getattr(Scheduler.schedule, "_lmcache_tier_bridge", False):
+        install_tier_schedule_bridge(Scheduler, self)
+
+    def _detach_tier_schedule_bridge(self) -> None:
+        """Drop this connector. Restore Scheduler.schedule when it is the last."""
+        try:
+            # Third Party
+            from vllm.v1.core.sched.scheduler import Scheduler
+        except ImportError:
             return
-        original = Scheduler.schedule
-
-        def schedule(scheduler, *args, **kwargs):
-            for impl in list(getattr(Scheduler, "_lmcache_tier_impls", ())):
-                bridge = getattr(impl, "on_vllm_schedule", None)
-                if callable(bridge):
-                    bridge(scheduler)
-            return original(scheduler, *args, **kwargs)
-
-        schedule._lmcache_tier_bridge = True  # type: ignore[attr-defined]
-        Scheduler.schedule = schedule  # type: ignore[method-assign]
+        detach_tier_schedule_bridge(Scheduler, self)
 
     def on_vllm_schedule(self, scheduler) -> None:
         """Start metadata lookup for waiting requests. Do not touch vLLM queues."""
