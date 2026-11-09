@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from importlib import import_module
 from importlib.metadata import PackageNotFoundError, distribution
 from importlib.resources import files
 
@@ -34,6 +35,21 @@ def test_frontend_assets_are_packaged() -> None:
     static_root = files("lmcache.inprocess.v1.cache_controller.frontend") / "static"
     assert (static_root / "index.html").is_file()
     assert (static_root / "js" / "controller_app.js").is_file()
+
+
+def test_console_script_entrypoints_import() -> None:
+    """Both console scripts import against the installed LMCache release.
+
+    The entry modules pull upstream helpers, so a symbol that LMCache renamed
+    or removed breaks ``lmcache-inprocess-standalone --help`` while the rest of
+    the wheel stays importable. Importing them here keeps that visible in the
+    smoke suite and in the nightly LMCache ``dev`` compatibility job.
+    """
+    for module in (
+        "lmcache.inprocess.standalone.__main__",
+        "lmcache.inprocess.v1.api_server.__main__",
+    ):
+        assert import_module(module) is not None
 
 
 def test_mock_connector_end_to_end_factory() -> None:

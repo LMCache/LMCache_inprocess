@@ -32,3 +32,5 @@ jobs:
         run: |
           cd "${RUNNER_TEMP}"
           python -m pytest -q "${GITHUB_WORKSPACE}/tests/smoke"
+          lmcache-inprocess-controller --help
+          lmcache-inprocess-standalone --help
