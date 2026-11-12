@@ -36,6 +36,7 @@ from lmcache.inprocess.integration.vllm.utils import (
     extract_mm_features,
     extract_request_configs_from_sampling_params,
     lmcache_get_or_create_config,
+    set_dp_rank_controller_identity,
 )
 from lmcache.inprocess.integration.vllm.vllm_service_factory import (
     VllmServiceFactory,
@@ -470,6 +471,7 @@ class LMCacheConnectorV1Impl:
             "LMCache v1 configuration is should be passed for vLLM v1."
         )
         self._apply_extra_config(config, vllm_config)
+        set_dp_rank_controller_identity(config, vllm_config)
         self.config = config
 
         service_factory = VllmServiceFactory(config, vllm_config, role.name.lower())
