@@ -42,6 +42,9 @@ Basic cache settings that control the core functionality of LMCache.
    * - local_cpu_use_hugepages
      - LMCACHE_LOCAL_CPU_USE_HUGEPAGES
      - Whether to use Linux hugepages (2 MB) for CPU-pinned KV cache memory. Not compatible with P2P mode or shared memory (multiprocess). Requires pre-allocated hugepages (``sysctl vm.nr_hugepages``). Values: true/false. Default: false
+   * - store_admission_retry_ms
+     - LMCACHE_STORE_ADMISSION_RETRY_MS
+     - Maximum milliseconds to retry a store-side CPU memory allocation (re-attempting eviction between retries) before dropping the chunk. Useful under concurrent store pressure when eviction candidates are temporarily pinned by in-flight requests. Dropped chunks never reach any storage backend, and lookups truncate at the first missing chunk. If the retry budget is exhausted, the failing chunk and every later chunk of that request are dropped and recorded as one ``lmcache:store_admission_failure_count`` event. The retry window is capped at 100 ms (larger values are clamped), and values of tens of milliseconds are recommended in practice. Default: 0 (drop immediately without retrying)
    * - local_disk
      - LMCACHE_LOCAL_DISK
      - Path (or comma-separated paths) to local disk cache directories. Format: ``"file:///path/to/cache"`` or ``"/path/a,/path/b"`` for multi-device I/O. See ``local_disk_path_sharding`` for how paths are assigned to GPUs.

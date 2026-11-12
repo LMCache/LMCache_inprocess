@@ -72,6 +72,7 @@ class LMCacheStats:
     interval_local_cpu_evict_count: int  # evict count
     interval_local_cpu_evict_keys_count: int  # evict keys count
     interval_local_cpu_evict_failed_count: int  # evict failed count
+    interval_store_admission_failure_count: int  # store drop events after retry
 
     # Real time value measurements (will be reset after each log)
     retrieve_hit_rate: float
@@ -294,6 +295,7 @@ class LMCStatsMonitor:
         self.interval_local_cpu_evict_count = 0
         self.interval_local_cpu_evict_keys_count = 0
         self.interval_local_cpu_evict_failed_count = 0
+        self.interval_store_admission_failure_count = 0
 
         self.local_cache_usage_bytes = 0
         self.remote_cache_usage_bytes = 0
@@ -571,6 +573,11 @@ class LMCStatsMonitor:
         self.interval_local_cpu_evict_failed_count += evict_failed_count
 
     @thread_safe
+    def update_store_admission_failure_count(self, dropped_count: int) -> None:
+        """Record store-path chunks dropped because CPU allocation failed."""
+        self.interval_store_admission_failure_count += dropped_count
+
+    @thread_safe
     def update_active_memory_objs_count(self, active_memory_objs_count: int):
         self.active_memory_objs_count = active_memory_objs_count
 
@@ -622,6 +629,7 @@ class LMCStatsMonitor:
         self.interval_local_cpu_evict_count = 0
         self.interval_local_cpu_evict_keys_count = 0
         self.interval_local_cpu_evict_failed_count = 0
+        self.interval_store_admission_failure_count = 0
 
         self.interval_p2p_requests = 0
         self.interval_p2p_transferred_tokens = 0
@@ -785,6 +793,7 @@ class LMCStatsMonitor:
             interval_local_cpu_evict_count=self.interval_local_cpu_evict_count,
             interval_local_cpu_evict_keys_count=self.interval_local_cpu_evict_keys_count,
             interval_local_cpu_evict_failed_count=self.interval_local_cpu_evict_failed_count,
+            interval_store_admission_failure_count=self.interval_store_admission_failure_count,
             local_cache_usage_bytes=self.local_cache_usage_bytes,
             remote_cache_usage_bytes=self.remote_cache_usage_bytes,
             local_storage_usage_bytes=self.local_storage_usage_bytes,
@@ -1027,6 +1036,14 @@ class PrometheusLogger:
         self.counter_local_cpu_evict_failed_count = self._create_counter(
             name="lmcache:local_cpu_evict_failed_count",
             documentation="Total number of failed eviction in local cpu backend",
+            labelnames=labelnames,
+        )
+
+        self.counter_store_admission_failure_count = self._create_counter(
+            name="lmcache:store_admission_failure_count",
+            documentation="Total number of store admission failure events "
+            "(store requests that dropped one or more KV chunks because CPU "
+            "memory allocation failed after bounded retry)",
             labelnames=labelnames,
         )
 
@@ -1719,6 +1736,10 @@ class PrometheusLogger:
         self._log_counter(
             self.counter_local_cpu_evict_failed_count,
             stats.interval_local_cpu_evict_failed_count,
+        )
+        self._log_counter(
+            self.counter_store_admission_failure_count,
+            stats.interval_store_admission_failure_count,
         )
         self._log_counter(
             self.counter_lookup_0_hit_requests,
