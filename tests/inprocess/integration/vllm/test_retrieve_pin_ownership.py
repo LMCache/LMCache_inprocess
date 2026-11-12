@@ -24,6 +24,7 @@ import torch
 
 # First Party
 from lmcache.inprocess.observability import LMCStatsMonitor, PrometheusLogger
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.cache_engine import LMCacheEngine
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.event_manager import EventStatus, EventType
@@ -32,7 +33,6 @@ from lmcache.inprocess.v1.metadata import LMCacheMetadata
 from lmcache.inprocess.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.inprocess.v1.storage_backend.storage_manager import StorageManager
 from lmcache.inprocess.v1.token_database import ChunkedTokenDatabase
-from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_allocators.ad_hoc_memory_allocator import AdHocMemoryAllocator
 from lmcache.v1.memory_management import MemoryObj
 from tests.inprocess.utils import create_test_memory_obj

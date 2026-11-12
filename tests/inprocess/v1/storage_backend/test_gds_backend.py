@@ -16,6 +16,7 @@ import torch
 
 # First Party
 from lmcache import torch_dev, torch_device_type
+from lmcache.inprocess.utils import CacheEngineKey, LayerCacheEngineKey
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
 from lmcache.inprocess.v1.storage_backend.gds_backend import (
@@ -28,7 +29,6 @@ from lmcache.inprocess.v1.storage_backend.gds_backend import (
     pack_metadata,
     unpack_metadata,
 )
-from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from tests.inprocess.utils import create_test_memory_obj, has_cufile, has_hipfile
 

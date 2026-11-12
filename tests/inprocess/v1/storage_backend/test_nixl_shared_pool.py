@@ -84,6 +84,7 @@ _NIXL_MOCK_KEYS = _install_nixl_mock_if_absent()
 
 # First Party
 from lmcache import torch_dev, torch_device_type  # noqa: E402
+from lmcache.inprocess.utils import CacheEngineKey  # noqa: E402
 from lmcache.inprocess.v1.config import LMCacheEngineConfig  # noqa: E402
 from lmcache.inprocess.v1.metadata import LMCacheMetadata  # noqa: E402
 from lmcache.inprocess.v1.storage_backend import CreateStorageBackends  # noqa: E402
@@ -93,7 +94,6 @@ from lmcache.inprocess.v1.storage_backend.local_cpu_backend import (  # noqa: E4
 from lmcache.inprocess.v1.storage_backend.path_sharder import (  # noqa: E402
     PathSharder,
 )
-from lmcache.utils import CacheEngineKey  # noqa: E402
 from lmcache.v1.memory_allocators.paged_tensor_memory_allocator import (  # noqa: E402
     PagedTensorMemoryAllocator,
 )

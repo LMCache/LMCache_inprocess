@@ -62,6 +62,7 @@ import torch
 
 # First Party
 from lmcache import torch_dev
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
 from lmcache.inprocess.v1.storage_backend.abstract_backend import (
@@ -72,7 +73,6 @@ from lmcache.inprocess.v1.storage_backend.path_sharder import PathSharder
 from lmcache.inprocess.v1.transfer_channel.transfer_utils import get_correct_device
 from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
 from lmcache.v1.memory_allocators.paged_tensor_memory_allocator import (
     PagedTensorMemoryAllocator,

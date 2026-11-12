@@ -17,6 +17,7 @@ import pytest
 import torch
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.health_monitor.base import HealthMonitor
 from lmcache.inprocess.v1.health_monitor.checks.remote_backend_check import (
@@ -29,7 +30,6 @@ from lmcache.inprocess.v1.storage_backend.connector.base_connector import (
 )
 from lmcache.inprocess.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.inprocess.v1.storage_backend.remote_backend import RemoteBackend
-from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryObj
 
 

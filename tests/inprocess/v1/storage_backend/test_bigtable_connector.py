@@ -90,6 +90,7 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey  # noqa: E402
 from lmcache.inprocess.v1.config import LMCacheEngineConfig  # noqa: E402
 from lmcache.inprocess.v1.metadata import LMCacheMetadata  # noqa: E402
 from lmcache.inprocess.v1.storage_backend.connector.bigtable_connector import (  # noqa: E402
@@ -101,7 +102,6 @@ from lmcache.inprocess.v1.storage_backend.local_cpu_backend import (  # noqa: E4
 from lmcache.inprocess.v1.storage_backend.remote_backend import (  # noqa: E402
     RemoteBackend,
 )
-from lmcache.utils import CacheEngineKey  # noqa: E402
 from lmcache.v1.memory_management import MemoryObj  # noqa: E402
 from tests.inprocess.utils import create_test_memory_obj  # noqa: E402
 
@@ -1078,7 +1078,7 @@ class TestBigtableConnector:
     def test_layerwise_row_keys_do_not_collide(self, async_loop, memory_allocator):
         """Verify that layerwise keys generate distinct row keys and write correctly."""
         # First Party
-        from lmcache.utils import LayerCacheEngineKey
+        from lmcache.inprocess.utils import LayerCacheEngineKey
 
         config = create_test_config()
         metadata = create_test_metadata(kv_shape=(1, 2, 256, 8, 128))
