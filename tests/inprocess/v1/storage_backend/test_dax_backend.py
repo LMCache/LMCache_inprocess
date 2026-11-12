@@ -17,11 +17,11 @@ import pytest
 import torch
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
 from lmcache.inprocess.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.inprocess.v1.storage_backend.plugins.dax_backend import DaxBackend
-from lmcache.utils import CacheEngineKey
 from lmcache.v1.distributed.l2_adapters.dax.core import DaxCore
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.memory_allocators.ad_hoc_memory_allocator import AdHocMemoryAllocator

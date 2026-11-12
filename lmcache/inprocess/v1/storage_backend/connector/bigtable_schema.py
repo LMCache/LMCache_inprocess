@@ -4,11 +4,11 @@
 from typing import TYPE_CHECKING, Any, Optional
 
 # First Party
-from lmcache.utils import LayerCacheEngineKey
+from lmcache.inprocess.utils import LayerCacheEngineKey
 
 if TYPE_CHECKING:
     # First Party
-    from lmcache.utils import CacheEngineKey
+    from lmcache.inprocess.utils import CacheEngineKey
 
 
 class BigtableSchema:

@@ -8,6 +8,7 @@ import asyncio
 import torch
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
 from lmcache.inprocess.v1.protocol import (
@@ -16,7 +17,6 @@ from lmcache.inprocess.v1.protocol import (
 )
 from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 
 logger = init_logger(__name__)

@@ -12,10 +12,10 @@ import time
 import torch
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
 from lmcache.inprocess.v1.storage_backend.remote_backend import RemoteBackend
 from lmcache.inprocess.v1.storage_backend.storage_manager import StorageManager
-from lmcache.utils import CacheEngineKey
 from lmcache.v1.kv_layer_groups import DTYPE_MAP
 
 # Import from lmcache with absolute paths

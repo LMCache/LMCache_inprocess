@@ -19,12 +19,12 @@ import torch
 pytest.importorskip("nixl")
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.storage_backend.nixl_storage_backend import (
     NixlDynamicStorageAgent,
     NixlDynamicStorageBackend,
     NixlStaticStorageBackend,
 )
-from lmcache.utils import CacheEngineKey
 
 # ---------------------------------------------------------------------------
 # Helpers

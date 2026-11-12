@@ -16,6 +16,7 @@ import torch
 import zmq
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.cache_controller.message import (
     BatchedP2PLookupMsg,
     BatchedP2PLookupRetMsg,
@@ -29,7 +30,6 @@ from lmcache.inprocess.v1.storage_backend.local_cpu_backend import LocalCPUBacke
 from lmcache.inprocess.v1.storage_backend.p2p_backend import P2PBackend
 from lmcache.inprocess.v1.transfer_channel.transfer_utils import P2PInitSideRetMsg
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryFormat
 from tests.inprocess.utils import get_available_ports
 

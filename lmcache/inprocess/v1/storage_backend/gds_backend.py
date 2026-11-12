@@ -21,6 +21,7 @@ import numpy as np
 import torch
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey, parse_cache_key
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.memory_allocators.cu_file_memory_allocator import (
     CuFileMemoryAllocator,
@@ -35,10 +36,8 @@ from lmcache.inprocess.v1.storage_backend.abstract_backend import (
 from lmcache.inprocess.v1.storage_backend.path_sharder import PathSharder
 from lmcache.logging import init_logger
 from lmcache.utils import (
-    CacheEngineKey,
     DiskCacheMetadata,
     _lmcache_nvtx_annotate,
-    parse_cache_key,
 )
 from lmcache.v1.memory_management import (
     MemoryFormat,

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, List
 import abc
 
 # First Party
-from lmcache.utils import CacheEngineKey
+from lmcache.inprocess.utils import CacheEngineKey
 
 if TYPE_CHECKING:
     # First Party
