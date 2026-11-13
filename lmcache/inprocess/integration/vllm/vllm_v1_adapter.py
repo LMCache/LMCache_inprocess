@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import math
 import os
 import sys
+import time
 
 # Third Party
 from vllm.config import (
@@ -46,6 +47,20 @@ from lmcache.inprocess.v1.compute.blend import LMCBlenderBuilder
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.config_base import validate_and_set_config_value
 from lmcache.inprocess.v1.manager import LMCacheManager
+from lmcache.inprocess.v1.storage_backend.local_cpu_backend import (
+    aligned_savable_tokens,
+    chunks_for_save_batch,
+)
+from lmcache.inprocess.v1.tier_pipeline import (
+    admission_cancels_lookup,
+    admission_tokens,
+    detach_tier_schedule_bridge,
+    forget_preempt,
+    install_tier_schedule_bridge,
+    metadata_lookup_expired,
+    offer_waiting_lookups,
+    scheduler_hbm_has_free_block,
+)
 from lmcache.logging import init_logger
 from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
 
@@ -492,6 +507,12 @@ class LMCacheConnectorV1Impl:
             VLLM_VERSION,
             getattr(self.lmcache_engine, "metadata", None),
         )
+        if role == KVConnectorRole.SCHEDULER and self._split_metadata_lookup_enabled():
+            self._tier_preempt_seen: dict[str, int] = {}
+            # False until a schedule pass reads free KV blocks. Unknown means
+            # not free, so a cold request is not reported as a miss.
+            self._tier_hbm_free = False
+            self._install_tier_schedule_bridge()
 
     def _apply_extra_config(
         self, config: LMCacheEngineConfig, vllm_config: "VllmConfig"
@@ -998,6 +1019,112 @@ class LMCacheConnectorV1Impl:
 
         return
 
+    def _savable_tokens_for_save(self, request: ReqMeta, *, layerwise: bool) -> int:
+        """Tokens this request will still write on the coming store call.
+
+        Matches the skip alignment in ``wait_for_save`` and ``save_kv_layer``:
+        a kv producer on the layerwise path stores from token 0, everyone else
+        drops the already-saved prefix aligned down to the LMCache chunk size.
+        """
+        save_spec = request.save_spec
+        if (
+            save_spec is None or not save_spec.can_save
+        ) and self.kv_role != "kv_producer":
+            return 0
+        token_ids = request.token_ids
+        if not isinstance(token_ids, list):
+            return 0
+        chunk_size = self._lmcache_chunk_size
+        if chunk_size <= 0:
+            return 0
+        if layerwise and self.kv_role == "kv_producer":
+            skip = 0
+        elif save_spec is None:
+            skip = 0
+        else:
+            skip = int(save_spec.skip_leading_tokens)
+            if (
+                not layerwise
+                and self.kv_role == "kv_producer"
+                and request.disagg_spec is not None
+            ):
+                skip = min(skip, int(request.disagg_spec.num_transferred_tokens))
+            if skip >= len(token_ids):
+                return 0
+            skip = skip // chunk_size * chunk_size
+        slot_mapping = getattr(request, "slot_mapping", None)
+        slot_count = None if slot_mapping is None else len(slot_mapping)
+        # Layerwise save does not cut a non-final prefill. The non-layerwise
+        # path does, unless blending is on. Either way the count below is a
+        # whole number of chunks: the partial tail is not rounded up.
+        return aligned_savable_tokens(
+            len(token_ids),
+            skip,
+            chunk_size,
+            last_prefill=True if layerwise else bool(request.is_last_prefill),
+            blending=bool(self.enable_blending) and not layerwise,
+            slot_count=slot_count,
+        )
+
+    def _aligned_slots_for_save(self, request: ReqMeta, *, layerwise: bool) -> int:
+        """Aligned chunks this request will allocate. Layerwise multiplies by layers."""
+        tokens = self._savable_tokens_for_save(request, layerwise=layerwise)
+        chunk_size = self._lmcache_chunk_size
+        if chunk_size <= 0 or tokens <= 0:
+            return 0
+        slots = tokens // chunk_size
+        if layerwise:
+            slots *= max(int(self.num_layers), 1)
+        return slots
+
+    def _pre_evict_save_batch(
+        self,
+        requests: list[ReqMeta],
+        *,
+        layerwise: bool,
+    ) -> int:
+        """Evict what fits, and return how many aligned slots are free afterwards.
+
+        The caller skips a request that still does not fit. Zero means the
+        free list could not be seen, or nothing is free.
+        """
+        engine = self.lmcache_engine
+        if engine is None:
+            return 0
+        pre_evict = getattr(engine, "pre_evict_for_save", None)
+        if not callable(pre_evict):
+            return 0
+        savable = [
+            self._savable_tokens_for_save(request, layerwise=layerwise)
+            for request in requests
+        ]
+        num_chunks = chunks_for_save_batch(savable, self._lmcache_chunk_size)
+        if num_chunks <= 0:
+            return 0
+        if layerwise:
+            num_chunks *= max(int(self.num_layers), 1)
+        slot_bytes = self._store_slot_bytes()
+        # slot_bytes is one chunk. store() allocates one chunk at a time, so
+        # holes add. The returned count is how many such allocations fit.
+        need_bytes = num_chunks * slot_bytes if slot_bytes > 0 else 0
+        return int(pre_evict(num_chunks, need_bytes, slot_bytes))
+
+    def _store_slot_bytes(self) -> int:
+        """Aligned bytes of one store chunk. Zero when the backend cannot say."""
+        engine = self.lmcache_engine
+        if engine is None:
+            return 0
+        manager = getattr(engine, "storage_manager", None)
+        backend = getattr(manager, "allocator_backend", None)
+        slot_bytes = getattr(backend, "aligned_store_slot_bytes", None)
+        if not callable(slot_bytes):
+            return 0
+        try:
+            return int(slot_bytes() or 0)
+        except Exception:
+            logger.debug("aligned store slot size is unavailable", exc_info=True)
+            return 0
+
     @_lmcache_nvtx_annotate
     def save_kv_layer(
         self,
@@ -1039,6 +1166,21 @@ class LMCacheConnectorV1Impl:
         kvcaches = list(self.kv_caches.values())
         is_first = True
 
+        # store_layer allocates on the first visit. Unpin first so lookup
+        # pins do not hide evictable chunks, then keep only requests that
+        # fit in the one-chunk slots eviction could actually free.
+        first_pass = any(
+            self._layerwise_save_storers.get(request.req_id) is None
+            for request in connector_metadata.requests
+        )
+        free_slots = 0
+        if first_pass:
+            for request in connector_metadata.requests:
+                self.lmcache_engine.lookup_unpin(request.req_id)
+            free_slots = self._pre_evict_save_batch(
+                connector_metadata.requests, layerwise=True
+            )
+
         for request in connector_metadata.requests:
             save_spec = request.save_spec
             if (
@@ -1048,6 +1190,20 @@ class LMCacheConnectorV1Impl:
 
             layerwise_storer = self._layerwise_save_storers.get(request.req_id)
             if layerwise_storer is None:
+                if not first_pass:
+                    continue
+                slots = self._aligned_slots_for_save(request, layerwise=True)
+                if slots <= 0 or slots > free_slots:
+                    if slots > free_slots:
+                        logger.info(
+                            "Dropping KV for request %s: need %d aligned slots, "
+                            "%d free; skipping D2H",
+                            request.req_id,
+                            slots,
+                            free_slots,
+                        )
+                    continue
+                free_slots -= slots
                 token_ids = request.token_ids
                 assert isinstance(token_ids, list)
 
@@ -1095,6 +1251,7 @@ class LMCacheConnectorV1Impl:
                     offset=skip_leading_tokens,
                     sync=is_first,
                     req_id=request.req_id,
+                    drop_on_alloc_miss=True,
                 )
                 self._layerwise_save_storers[request.req_id] = layerwise_storer
                 if is_first:
@@ -1144,10 +1301,15 @@ class LMCacheConnectorV1Impl:
         # Probe decoder cache before store if bidirectional mode is enabled
         bidir_enabled = getattr(self.config, "pd_bidirectional", False)
 
+        # Unpin the whole batch before eviction. Async lookup pins would
+        # otherwise make can_evict false and the pass would free nothing.
         for request in connector_metadata.requests:
-            # unpin the kv caches according to req_id
             self.lmcache_engine.lookup_unpin(request.req_id)
+        free_slots = self._pre_evict_save_batch(
+            connector_metadata.requests, layerwise=False
+        )
 
+        for request in connector_metadata.requests:
             save_spec = request.save_spec
             if (
                 save_spec is None or not save_spec.can_save
@@ -1201,6 +1363,23 @@ class LMCacheConnectorV1Impl:
                 request.req_id,
             )
 
+            slots = self._aligned_slots_for_save(request, layerwise=False)
+            if slots <= 0:
+                continue
+            # free_slots counts one-chunk allocations across holes. A hole
+            # smaller than one chunk is zero. The whole request is skipped
+            # when fewer than that many allocations fit.
+            if slots > free_slots:
+                logger.info(
+                    "Dropping KV for request %s: need %d aligned slots, "
+                    "%d free; skipping D2H",
+                    request.req_id,
+                    slots,
+                    free_slots,
+                )
+                continue
+            free_slots -= slots
+
             is_last_prefill = request.is_last_prefill
             if is_last_prefill:
                 if request.disagg_spec:
@@ -1235,6 +1414,7 @@ class LMCacheConnectorV1Impl:
                 transfer_spec=request.disagg_spec,
                 request_configs=request.request_configs,
                 req_id=request.req_id,
+                drop_on_alloc_miss=True,
             )
 
             # Probe decoder cache after store
@@ -1352,7 +1532,79 @@ class LMCacheConnectorV1Impl:
     def shutdown(self):
         """Shutdown the connector by delegating to LMCacheManager."""
         logger.info("Starting LMCacheConnector shutdown...")
+        self._detach_tier_schedule_bridge()
         self._manager.stop_services()
+
+    def _split_metadata_lookup_enabled(self) -> bool:
+        cfg = getattr(self, "config", None)
+        if cfg is None:
+            return False
+        if not bool(getattr(cfg, "split_metadata_lookup", False)):
+            return False
+        if not bool(getattr(cfg, "enable_async_loading", False)):
+            return False
+        client = self.lookup_client
+        return client is not None and callable(getattr(client, "lookup_phase", None))
+
+    def _install_tier_schedule_bridge(self) -> None:
+        """Wrap Scheduler.schedule only while the split flag is on."""
+        # Third Party
+        from vllm.v1.core.sched.scheduler import Scheduler
+
+        install_tier_schedule_bridge(Scheduler, self)
+
+    def _detach_tier_schedule_bridge(self) -> None:
+        """Drop this connector. Restore Scheduler.schedule when it is the last."""
+        try:
+            # Third Party
+            from vllm.v1.core.sched.scheduler import Scheduler
+        except ImportError:
+            return
+        detach_tier_schedule_bridge(Scheduler, self)
+
+    def on_vllm_schedule(self, scheduler) -> None:
+        """Start metadata lookup for waiting requests. Do not touch vLLM queues."""
+        if not self._split_metadata_lookup_enabled():
+            return
+        # One read per schedule pass. vLLM 0.33 exposes this on
+        # KVCacheManager.block_pool. Missing means not free.
+        self._tier_hbm_free = scheduler_hbm_has_free_block(scheduler)
+        offer_waiting_lookups(
+            scheduler,
+            self.lookup_client,
+            self._prepare_lookup_tokens,
+            self._waiting_lookup_window(scheduler),
+            self._tier_preempt_seen,
+        )
+
+    def _waiting_lookup_window(self, scheduler) -> int:
+        for owner in (scheduler, getattr(self, "_vllm_config", None)):
+            cfg = (
+                getattr(owner, "scheduler_config", None) if owner is not None else None
+            )
+            raw = getattr(cfg, "max_num_seqs", None) if cfg is not None else None
+            if raw is None:
+                continue
+            try:
+                return max(1, int(raw))
+            except (TypeError, ValueError):
+                continue
+        return 1
+
+    def _prepare_lookup_tokens(self, request):
+        token_ids = request.all_token_ids
+        mm_hashes, mm_positions = extract_mm_features(request)
+        if mm_hashes and mm_positions:
+            token_ids = torch.tensor(request.prompt_token_ids)
+            apply_mm_hashes_to_token_ids(token_ids, mm_hashes, mm_positions)
+            token_ids = token_ids.tolist()
+        request_configs = extract_request_configs(request.sampling_params)
+        if self.skip_last_n_tokens > 0:
+            token_ids = token_ids[: -self.skip_last_n_tokens]
+        self._requests_priority[request.request_id] = int(
+            getattr(request, "priority", 0) or 0
+        )
+        return token_ids, request_configs
 
     ###################
     # Scheduler side APIs
@@ -1400,7 +1652,38 @@ class LMCacheConnectorV1Impl:
         if self.lookup_client is None:
             return 0
 
-        if (
+        if self._split_metadata_lookup_enabled():
+            # Lookup was offered at the start of this schedule pass. The ACK
+            # has not arrived yet, so the phase is still pending. A body that
+            # is already in host is admitted. With no preloaded request and a
+            # free KV block, pending, queued, and absent are a miss so the GPU
+            # recomputes. Otherwise they stay None. A metadata ACK that never
+            # arrives still becomes a miss after lookup_timeout_ms.
+            phase = self.lookup_client.lookup_phase(req_id)
+            offered_at = self.lookup_client.lookup_offered_at(req_id)
+            if metadata_lookup_expired(
+                phase,
+                offered_at,
+                getattr(self.config, "lookup_timeout_ms", 0),
+                time.monotonic(),
+            ):
+                self.lookup_client.cancel_lookup(req_id)
+                return 0
+            admission = getattr(self.lookup_client, "tier_admission", None)
+            has_ready = getattr(admission, "has_ready", None)
+            any_ready = bool(has_ready()) if callable(has_ready) else False
+            admitted = admission_tokens(
+                phase,
+                self.lookup_client.preloaded_tokens(req_id),
+                any_ready=any_ready,
+                hbm_free=bool(getattr(self, "_tier_hbm_free", False)),
+            )
+            if admission_cancels_lookup(phase, admitted):
+                self.lookup_client.cancel_lookup(req_id)
+            if admitted is None:
+                return None
+            num_external_hit_tokens = admitted
+        elif (
             num_external_hit_tokens := self.lookup_client.lookup_cache(lookup_id=req_id)
         ) != -1:
             # -1 means no result cached
@@ -1861,6 +2144,10 @@ class LMCacheConnectorV1Impl:
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
+        seen = getattr(self, "_tier_preempt_seen", None)
+        if isinstance(seen, dict):
+            forget_preempt(seen, request.request_id)
+
         # Layerwise save uses request-scoped generators. If request finishes
         # without entering wait_for_save (abort/error/evict path), make sure
         # we release the generator entry to avoid leaking state.

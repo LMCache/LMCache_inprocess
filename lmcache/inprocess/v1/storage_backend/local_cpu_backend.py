@@ -26,7 +26,6 @@ from lmcache.inprocess.v1.storage_backend.batched_message_sender import (
 )
 from lmcache.inprocess.v1.storage_backend.cache_policy import get_cache_policy
 from lmcache.inprocess.v1.system_detection import NUMADetector, SystemMemoryDetector
-from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
@@ -41,6 +40,133 @@ if TYPE_CHECKING:
     from lmcache.inprocess.v1.cache_controller.worker import LMCacheWorker
 
 logger = init_logger(__name__)
+
+# One vLLM step stores at most max_num_batched_tokens / chunk_size chunks.
+# This bench is 8192 / 256 = 32. The cap is that step limit, not a new config key.
+STORE_PREEVICT_CHUNK_CAP = 32
+
+# Same integers as surdata_vllm.config.STORE_POOL_DEFAULT / PRELOAD_POOL_DEFAULT.
+# A max_local_cpu_size of exactly 20 uses these two pools. Host MemTotal,
+# MemAvailable, KV HBM, and OOM logs do not change them.
+STORE_POOL_BYTES = 8589934592
+PRELOAD_POOL_BYTES = 12884901888
+
+
+def aligned_savable_tokens(
+    token_count: int,
+    skip_leading_tokens: int,
+    chunk_size: int,
+    *,
+    last_prefill: bool,
+    blending: bool,
+    slot_count: Optional[int] = None,
+) -> int:
+    """Tokens that will actually be stored, both ends on a chunk boundary.
+
+    A slot-mapping length that does not match the tokens stores nothing.
+    The already-saved prefix is aligned down. A non-final prefill without
+    blending also drops the tail that does not fill a chunk. The partial
+    tail is never rounded up into an extra chunk.
+    """
+    if chunk_size <= 0 or token_count <= 0:
+        return 0
+    if slot_count is not None and int(slot_count) != int(token_count):
+        return 0
+    if skip_leading_tokens >= token_count:
+        return 0
+    skip = (int(skip_leading_tokens) // chunk_size) * chunk_size
+    end = int(token_count)
+    if not last_prefill and not blending:
+        end = (end // chunk_size) * chunk_size
+    savable = end - skip
+    if savable <= 0:
+        return 0
+    return (savable // chunk_size) * chunk_size
+
+
+def chunks_for_save_batch(
+    savable_tokens: list[int],
+    chunk_size: int,
+    cap: int = STORE_PREEVICT_CHUNK_CAP,
+) -> int:
+    """Chunk count for one store batch.
+
+    ``savable_tokens`` is the aligned token count of each request. Partial
+    tails count as zero chunks. The sum is clamped to ``cap`` so one batch
+    cannot ask for more than one engine step.
+    """
+    if chunk_size <= 0 or cap <= 0:
+        return 0
+    total = 0
+    for count in savable_tokens:
+        if count <= 0:
+            continue
+        total += int(count) // chunk_size
+        if total >= cap:
+            return cap
+    return total
+
+
+def aligned_slot_bytes(chunk_bytes: int, align_bytes: int) -> int:
+    """Round a chunk up to the allocator alignment. Zero when either is invalid."""
+    if chunk_bytes <= 0:
+        return 0
+    align = int(align_bytes) if align_bytes else 1
+    if align <= 0:
+        align = 1
+    return ((int(chunk_bytes) + align - 1) // align) * align
+
+
+def aligned_free_slot_count(free_blocks, aligned_bytes: int) -> int:
+    """How many aligned chunks fit in the free address list.
+
+    Each contiguous free block contributes ``size // aligned_bytes``. A
+    fragment smaller than one aligned chunk contributes nothing, so a large
+    total of tiny holes is not treated as free capacity.
+    """
+    if aligned_bytes <= 0:
+        return 0
+    slots = 0
+    for block in free_blocks:
+        size = int(getattr(block, "size", 0) or 0)
+        if size >= aligned_bytes:
+            slots += size // aligned_bytes
+    return slots
+
+
+def largest_contiguous_slot_count(free_blocks, aligned_bytes: int) -> int:
+    """Chunks that fit in the single longest free span.
+
+    A hole smaller than one aligned chunk counts as zero. Admission does not
+    use this. ``store`` allocates one chunk at a time, so two holes of three
+    chunks are six allocatable slots.
+    """
+    if aligned_bytes <= 0:
+        return 0
+    largest = 0
+    for block in free_blocks:
+        size = int(getattr(block, "size", 0) or 0)
+        if size >= aligned_bytes:
+            largest = max(largest, size // aligned_bytes)
+    return largest
+
+
+def free_address_bytes(free_blocks) -> int:
+    """Sum of free address-block sizes. Fragments are included."""
+    total = 0
+    for block in free_blocks:
+        total += int(getattr(block, "size", 0) or 0)
+    return total
+
+
+def _chunk_size_bytes(shapes, dtypes) -> int:
+    """Bytes of one KV chunk. Imported lazily so store pre-evict can load
+    without the vLLM KV-format registry, which asks for native symbols.
+    """
+    # First Party
+    from lmcache.integration.vllm.utils import get_size_bytes
+
+    return int(get_size_bytes(shapes, dtypes))
 
 
 class LocalCPUBackend(AllocatorBackendInterface):
@@ -71,11 +197,18 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # test compatibility
         # TODO: fix the tests to get rid the memory allocator
         assert metadata is not None or memory_allocator is not None
+        # initialize_allocator sets these when the 20GiB default pool is split.
+        self._split_pools = False
         self.memory_allocator = (
             self.initialize_allocator(config, metadata)  # type: ignore
             if memory_allocator is None
             else memory_allocator
         )
+        if not hasattr(self, "preload_allocator"):
+            self.preload_allocator = self.memory_allocator
+        # Injected tests and P2P/NIXL/io_uring keep one allocator. purpose is
+        # then a no-op: store and preload allocate from the same object.
+        self.store_allocator = self.memory_allocator
         self.lmcache_worker = lmcache_worker
         self.instance_id = config.lmcache_instance_id
         self.cpu_lock = threading.Lock()
@@ -424,7 +557,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             dtypes = metadata.get_dtypes()
 
             paged_mem_allocator = PagedCpuGpuMemoryAllocator()
-            chunk_size_bytes = get_size_bytes(shapes, dtypes)
+            chunk_size_bytes = _chunk_size_bytes(shapes, dtypes)
             origin_cpu_size_bytes = cpu_size_bytes
             align_cpu_size_bytes = (
                 origin_cpu_size_bytes // chunk_size_bytes * chunk_size_bytes
@@ -454,7 +587,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             if nixl_cpu_enabled:
                 if metadata is None:
                     raise ValueError("metadata required for NIXL CPU mode")
-                chunk_bytes = get_size_bytes(
+                chunk_bytes = _chunk_size_bytes(
                     metadata.get_shapes(), metadata.get_dtypes()
                 )
                 aligned_size = (cpu_size_bytes // chunk_bytes) * chunk_bytes
@@ -533,7 +666,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     fmt = MemoryFormat.KV_2LTD
 
                 # Calculate chunk size for alignment
-                chunk_size_bytes = get_size_bytes(shapes, dtypes)
+                chunk_size_bytes = _chunk_size_bytes(shapes, dtypes)
                 origin_cpu_size_bytes = cpu_size_bytes
                 # Align cpu_size_bytes to be a multiple of chunk_size_bytes
                 align_cpu_size_bytes = (
@@ -567,20 +700,30 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     **kwargs,
                 )
 
-            # Default: use non-paged allocator
+            # Default: use non-paged allocator. Exactly 20GiB is SurData's
+            # two direct pools (8GiB store, 12GiB preload). P2P, NIXL, and
+            # io_uring returned above and stay a single allocator.
+            pool_kwargs: dict[str, Any] = {
+                "numa_mapping": numa_mapping,
+                "use_hugepages": use_hugepages,
+            }
             if allocator_align_bytes is not None:
-                return MixedMemoryAllocator(
-                    cpu_size_bytes,
-                    numa_mapping=numa_mapping,
-                    align_bytes=allocator_align_bytes,
-                    use_hugepages=use_hugepages,
+                pool_kwargs["align_bytes"] = allocator_align_bytes
+            else:
+                pool_kwargs["config"] = config
+            if cpu_size_bytes == STORE_POOL_BYTES + PRELOAD_POOL_BYTES:
+                logger.info(
+                    "LocalCPUBackend: 20GiB hot cache split into store %d "
+                    "bytes and preload %d bytes",
+                    STORE_POOL_BYTES,
+                    PRELOAD_POOL_BYTES,
                 )
-            return MixedMemoryAllocator(
-                cpu_size_bytes,
-                numa_mapping=numa_mapping,
-                config=config,
-                use_hugepages=use_hugepages,
-            )
+                self._split_pools = True
+                self.preload_allocator = MixedMemoryAllocator(
+                    PRELOAD_POOL_BYTES, **pool_kwargs
+                )
+                return MixedMemoryAllocator(STORE_POOL_BYTES, **pool_kwargs)
+            return MixedMemoryAllocator(cpu_size_bytes, **pool_kwargs)
 
     @staticmethod
     def _is_power_of_two(value: int) -> bool:
@@ -652,6 +795,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         fmt: Optional[MemoryFormat] = None,
         eviction: bool = True,
         busy_loop: bool = True,
+        purpose: str = "store",
     ) -> Optional[MemoryObj]:
         """
         Allocate a memory object of shape and dtype
@@ -672,7 +816,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
         (we use the async serializer to handle this)
         """
         logger.debug(
-            "Allocating memory in local cpu backend with busy loop: %s", busy_loop
+            "Allocating memory in local cpu backend with busy loop: %s purpose: %s",
+            busy_loop,
+            purpose,
         )
         if fmt is None:
             if self.layerwise:
@@ -683,7 +829,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
             else:
                 fmt = MemoryFormat.KV_2LTD
 
-        memory_obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
+        allocator = self._allocator_for(purpose)
+        memory_obj = allocator.allocate(shapes, dtypes, fmt)
         if memory_obj is not None or not eviction:
             return memory_obj
 
@@ -698,9 +845,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 num_candidates = 1
                 evict_keys = None
                 with self.cpu_lock:
-                    evict_keys = self.cache_policy.get_evict_candidates(
-                        self.hot_cache, num_candidates=num_candidates
-                    )
+                    evict_keys = self._evict_keys(allocator, num_candidates)
                     if evict_keys:
                         # we can continue trying to evict from the hot_cache
                         # and don't need to wait for other requests yet
@@ -735,7 +880,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 # do not hold the lock during sleep
                 time.sleep(time_to_wait)
 
-            memory_obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
+            memory_obj = allocator.allocate(shapes, dtypes, fmt)
             if memory_obj is not None:
                 break
 
@@ -749,6 +894,240 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.stats_monitor.update_local_cpu_evict_metrics(evict_keys_count)
         return memory_obj
 
+    def _store_chunk_bytes(self) -> Optional[int]:
+        """Bytes of one full chunk already sitting in the hot cache.
+
+        Store chunks are uniform when partial chunks are not saved, so one
+        resident object's physical size is the slot size ``allocate`` needs.
+        """
+        for memory_obj in self.hot_cache.values():
+            size_of = getattr(memory_obj, "get_physical_size", None)
+            if not callable(size_of):
+                continue
+            try:
+                size = int(size_of())
+            except Exception:
+                continue
+            if size > 0:
+                return size
+        return None
+
+    def _aligned_slot_bytes(self) -> Optional[int]:
+        """One store slot, rounded up to the pinned allocator alignment."""
+        chunk_bytes: Optional[int] = None
+        if self.metadata is not None:
+            try:
+                chunk_bytes = int(self.get_full_chunk_size_bytes())
+            except Exception:
+                chunk_bytes = None
+        if chunk_bytes is None or chunk_bytes <= 0:
+            chunk_bytes = self._store_chunk_bytes()
+        if chunk_bytes is None or chunk_bytes <= 0:
+            return None
+        allocator = self.memory_allocator
+        pin = getattr(allocator, "pin_allocator", allocator)
+        address_manager = getattr(pin, "address_manager", None)
+        align = getattr(allocator, "align_bytes", None)
+        if not align:
+            align = getattr(pin, "align_bytes", None)
+        if not align and address_manager is not None:
+            align = getattr(address_manager, "_align", None)
+        return aligned_slot_bytes(chunk_bytes, int(align or 1))
+
+    def _store_pool(self):
+        """Allocator D2H allocates from. One allocator when pools are not split."""
+        if self._split_pools:
+            return self.store_allocator
+        return self.memory_allocator
+
+    def _allocator_for(self, purpose: str):
+        """Pick the pool for this allocate. One allocator ignores purpose."""
+        if not self._split_pools:
+            return self.memory_allocator
+        if purpose == "preload":
+            return self.preload_allocator
+        return self.store_allocator
+
+    def _obj_in_allocator(self, memory_obj, allocator) -> bool:
+        """True when this hot-cache object lives in ``allocator``.
+
+        A single allocator owns every object. Split pools compare
+        ``parent_allocator``, which MixedMemoryAllocator sets at allocate.
+        """
+        if not self._split_pools:
+            return True
+        return getattr(memory_obj, "parent_allocator", None) is allocator
+
+    def _evict_keys(self, allocator, num_candidates: int) -> list:
+        """Evictable hot-cache keys whose memory is in ``allocator``.
+
+        In-flight disk writes have ref_count greater than 1, so ``can_evict``
+        is false and they stay. The other pool is not a victim source.
+        """
+        if num_candidates <= 0:
+            return []
+        if not self._split_pools:
+            return self.cache_policy.get_evict_candidates(
+                self.hot_cache, num_candidates=num_candidates
+            )
+        picked = []
+        for key, memory_obj in self.hot_cache.items():
+            if not memory_obj.can_evict:
+                continue
+            if not self._obj_in_allocator(memory_obj, allocator):
+                continue
+            picked.append(key)
+            if len(picked) >= num_candidates:
+                break
+        return picked
+
+    def _read_free_blocks(self, allocator):
+        """Free address list, or None when this allocator does not expose one."""
+        pin = getattr(allocator, "pin_allocator", allocator)
+        address_manager = getattr(pin, "address_manager", None)
+        free_blocks = getattr(address_manager, "_explicit_list", None)
+        if free_blocks is None:
+            return None, None
+        return free_blocks, getattr(address_manager, "_lock", None)
+
+    def _pool_free_stats(
+        self, allocator, aligned_bytes: int
+    ) -> Optional[tuple[int, int, int]]:
+        """``(free_bytes, longest_span_slots, allocatable_slots)`` for one pool.
+
+        ``None`` means the free list is hidden. A hole smaller than one
+        aligned chunk adds bytes but zero allocatable slots. Allocatable
+        slots are the sum across holes, because ``store`` takes one chunk
+        at a time.
+        """
+        free_blocks, lock = self._read_free_blocks(allocator)
+        if free_blocks is None:
+            return None
+
+        def _read() -> tuple[int, int, int]:
+            return (
+                free_address_bytes(free_blocks),
+                largest_contiguous_slot_count(free_blocks, aligned_bytes),
+                aligned_free_slot_count(free_blocks, aligned_bytes),
+            )
+
+        if lock is None:
+            return _read()
+        with lock:
+            return _read()
+
+    def allocatable_bytes(self, allocator, aligned_bytes: int) -> Optional[int]:
+        """Bytes covered by one-chunk holes in ``allocator``.
+
+        A hole smaller than ``aligned_bytes`` adds nothing. ``None`` means
+        the free list is hidden or the chunk size is unknown. Several holes
+        add, because ``allocate`` takes one chunk at a time.
+        """
+        if aligned_bytes <= 0:
+            return None
+        stats = self._pool_free_stats(allocator, aligned_bytes)
+        if stats is None:
+            return None
+        return int(stats[2]) * int(aligned_bytes)
+
+    def host_allocatable_bytes(self, aligned_bytes: int) -> Optional[int]:
+        """Bytes a disk GET can pin. Split pools use the preload allocator."""
+        return self.allocatable_bytes(self._allocator_for("preload"), aligned_bytes)
+
+    def aligned_store_slot_bytes(self) -> int:
+        """One store chunk, aligned. Zero when the size cannot be known."""
+        size = self._aligned_slot_bytes()
+        if size is None or size <= 0:
+            return 0
+        return int(size)
+
+    def _aligned_free_slots(self, aligned_bytes: int) -> Optional[int]:
+        """Sum of aligned chunks across free spans of the store pool.
+
+        ``None`` means the allocator does not expose its free list. Callers
+        treat that as no room and skip the D2H. Admission uses this sum.
+        A hole smaller than one aligned chunk contributes nothing.
+        """
+        if aligned_bytes <= 0:
+            return None
+        free_blocks, lock = self._read_free_blocks(self._store_pool())
+        if free_blocks is None:
+            return None
+        if lock is None:
+            return aligned_free_slot_count(free_blocks, aligned_bytes)
+        with lock:
+            return aligned_free_slot_count(free_blocks, aligned_bytes)
+
+    @_lmcache_nvtx_annotate
+    def ensure_free_chunks(
+        self,
+        num_chunks: int,
+        need_bytes: int = 0,
+        span_bytes: int = 0,
+    ) -> int:
+        """Reclaim the store pool until this step has enough chunk slots.
+
+        ``span_bytes`` is one aligned chunk. ``store`` allocates one chunk at
+        a time, so a slot is one hole of at least that size, and several holes
+        add. Reclaim continues while the sum of those slots is below
+        ``num_chunks``. Raw free bytes are not the stop condition: a 7-chunk
+        hole plus fragments still short of the budget keeps evicting.
+        Victims are ``can_evict`` objects in the store pool only. Pinned
+        objects and in-flight disk writes stay. Returns how many one-chunk
+        allocations fit afterwards, which may be less than ``num_chunks``.
+        No sleep. A missing free list returns 0.
+        """
+        del need_bytes
+        if not self.use_hot:
+            return 0
+        aligned_bytes = self._aligned_slot_bytes()
+        if aligned_bytes is None:
+            return 0
+        # One slot is one chunk. The caller's span is that size when known.
+        slot_bytes = span_bytes if span_bytes > 0 else aligned_bytes
+
+        store_pool = self._store_pool()
+        evicted = 0
+        slot_count = 0
+        while True:
+            stats = self._pool_free_stats(store_pool, slot_bytes)
+            if stats is None:
+                return 0
+            _free_bytes, _largest_slots, slot_count = stats
+            if num_chunks <= 0 or slot_count >= num_chunks:
+                break
+            with self.cpu_lock:
+                evict_keys = self._evict_keys(
+                    store_pool, min(64, max(1, num_chunks or 1))
+                )
+                if not evict_keys:
+                    self.stats_monitor.update_local_cpu_evict_failed_count(
+                        max(num_chunks, 1)
+                    )
+                    break
+                # force=False keeps lookup pins. can_evict already skipped
+                # pinned and in-flight objects, and remove() does not take
+                # cpu_lock again when force is false.
+                removed = self.batched_remove(evict_keys, force=False)
+            if removed <= 0:
+                self.stats_monitor.update_local_cpu_evict_failed_count(
+                    max(num_chunks, 1)
+                )
+                break
+            evicted += removed
+
+        if evicted:
+            self.stats_monitor.update_local_cpu_evict_metrics(evicted)
+            logger.debug(
+                "Pre-evicted %d chunks from the store pool for a %d slot store",
+                evicted,
+                num_chunks,
+            )
+        stats = self._pool_free_stats(store_pool, slot_bytes)
+        if stats is None:
+            return 0
+        return stats[2]
+
     @_lmcache_nvtx_annotate
     def batched_allocate(
         self,
@@ -758,6 +1137,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         fmt: Optional[MemoryFormat] = None,
         eviction: bool = True,
         busy_loop: bool = True,
+        purpose: str = "store",
     ) -> Optional[List[MemoryObj]]:
         """
         Batched allocate `batch_size` memory objects of shape and dtype
@@ -778,8 +1158,10 @@ class LocalCPUBackend(AllocatorBackendInterface):
         (we use the async serializer to handle this)
         """
         logger.debug(
-            "Batched allocating memory in local cpu backend with busy loop: %s",
+            "Batched allocating memory in local cpu backend with busy loop: %s "
+            "purpose: %s",
             busy_loop,
+            purpose,
         )
         if fmt is None:
             if self.layerwise:
@@ -790,14 +1172,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
             else:
                 fmt = MemoryFormat.KV_2LTD
 
-        memory_objs = self.memory_allocator.batched_allocate(
-            shapes, dtypes, batch_size, fmt
-        )
+        allocator = self._allocator_for(purpose)
+        memory_objs = allocator.batched_allocate(shapes, dtypes, batch_size, fmt)
 
         if memory_objs is not None or not eviction:
             return memory_objs
 
-        assert isinstance(self.memory_allocator, MixedMemoryAllocator)
+        assert isinstance(allocator, MixedMemoryAllocator)
 
         evict_keys_count = 0
         num_attempts = 0
@@ -809,9 +1190,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 num_candidates = min(64, max(1, len(self.hot_cache)))
                 evict_keys = None
                 with self.cpu_lock:
-                    evict_keys = self.cache_policy.get_evict_candidates(
-                        self.hot_cache, num_candidates=num_candidates
-                    )
+                    evict_keys = self._evict_keys(allocator, num_candidates)
 
                     # HACK: We assume batch_size=num_layers here.
                     # FIXME: We also assume if the one layer's ref_count > 1 or pinned,
@@ -827,7 +1206,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
                             old_mem_objs: list[MemoryObj] = []
                             for key in evict_key_all_layer:
                                 old_mem_obj = self.hot_cache.get(key)
-                                if old_mem_obj is None or not old_mem_obj.can_evict:
+                                if (
+                                    old_mem_obj is None
+                                    or not old_mem_obj.can_evict
+                                    or not self._obj_in_allocator(
+                                        old_mem_obj, allocator
+                                    )
+                                ):
                                     old_mem_objs = []
                                     break
                                 old_mem_objs.append(old_mem_obj)
@@ -841,7 +1226,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                                 self.cache_policy.update_on_force_evict(key)
                                 self.hot_cache.pop(key, None)
 
-                            self.memory_allocator.batched_free(old_mem_objs)
+                            allocator.batched_free(old_mem_objs)
 
                             logger.debug(
                                 "Evicting %d chunks from cpu memory", len(old_mem_objs)
@@ -871,9 +1256,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 # do not hold the lock during sleep
                 time.sleep(time_to_wait)
 
-            memory_objs = self.memory_allocator.batched_allocate(
-                shapes, dtypes, batch_size, fmt
-            )
+            memory_objs = allocator.batched_allocate(shapes, dtypes, batch_size, fmt)
             if memory_objs is not None:
                 break
 
@@ -887,7 +1270,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
         return memory_objs
 
     def get_full_chunk_size_bytes(self) -> int:
-        logger.info("Calculating the size of a single LMCache chunk")
+        cached = getattr(self, "_full_chunk_size_bytes", None)
+        if cached is not None:
+            return int(cached)
         assert self.metadata is not None, (
             "metadata required for chunk budget calculation"
         )
@@ -924,7 +1309,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
             hidden_dim,
         )
         logger.debug("Calculated bytes per chunk per rank: %s", chunk_bytes)
-        return chunk_bytes
+        self._full_chunk_size_bytes = int(chunk_bytes)
+        return int(chunk_bytes)
 
     def calculate_chunk_budget(self) -> int:
         """
@@ -990,5 +1376,16 @@ class LocalCPUBackend(AllocatorBackendInterface):
     def close(self) -> None:
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
-        self.memory_allocator.close()
+        closed: set[int] = set()
+        for alloc in (
+            getattr(self, "memory_allocator", None),
+            getattr(self, "store_allocator", None),
+            getattr(self, "preload_allocator", None),
+        ):
+            if alloc is None or id(alloc) in closed:
+                continue
+            closed.add(id(alloc))
+            closer = getattr(alloc, "close", None)
+            if callable(closer):
+                closer()
         self.clear()

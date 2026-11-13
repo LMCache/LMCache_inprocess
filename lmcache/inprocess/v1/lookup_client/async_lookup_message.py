@@ -20,6 +20,9 @@ class LookupRequestMsg(AsyncLookupMsg):
     hashes: list[int]
     offsets: list[int]
     request_configs: Optional[Dict[str, str]] = None
+    # Bumped when the scheduler retires a lookup. The worker echoes it so a
+    # response from the previous prefix cannot be applied to the next one.
+    epoch: int = 0
 
     def describe(self) -> str:
         return (
@@ -29,10 +32,18 @@ class LookupRequestMsg(AsyncLookupMsg):
 
 
 class LookupResponseMsg(AsyncLookupMsg):
-    """Async lookup response message from worker to scheduler"""
+    """Async lookup response message from worker to scheduler.
+
+    An empty ``kind`` is the legacy single response: the tokens are already
+    in host memory. ``kind="lookup"`` is only the metadata hit length.
+    ``kind="reading"`` means host GET has started and carries no length.
+    ``kind="preloaded"`` means the body is in host memory.
+    """
 
     lookup_id: str
     num_hit_tokens: int
+    kind: str = ""
+    epoch: int = 0
 
     def describe(self) -> str:
         return (
@@ -45,6 +56,9 @@ class LookupCleanupMsg(AsyncLookupMsg):
     """Cleanup message from scheduler to worker to release memory objects"""
 
     lookup_id: str
+    # The attempt being cancelled. 0 keeps the previous "cancel whatever is
+    # current" behavior for lookups that were not started on the split path.
+    epoch: int = 0
 
     def describe(self) -> str:
         return f"Cleanup memory for lookup_id={self.lookup_id}"

@@ -32,7 +32,7 @@ from lmcache import torch_dev, torch_device_type
 from lmcache.inprocess.observability import LMCacheStatsLogger, LMCStatsMonitor
 from lmcache.inprocess.usage_telemetry.context import InitializeUsageContext
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
-from lmcache.inprocess.v1.event_manager import EventManager, EventStatus, EventType
+from lmcache.inprocess.v1.event_manager import EventManager, EventType
 from lmcache.inprocess.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.inprocess.v1.gpu_connector.utils import assert_layerwise_gpu_connector
 from lmcache.inprocess.v1.hidden_state_store import HiddenStateStore
@@ -382,6 +382,29 @@ class LMCacheEngine:
             return self.storage_manager.is_hot_cache_enabled()
         return False
 
+    def pre_evict_for_save(
+        self,
+        num_chunks: int,
+        need_bytes: int = 0,
+        span_bytes: int = 0,
+    ) -> int:
+        """Reclaim the store pool before this step's stores allocate.
+
+        ``num_chunks`` is how many one-chunk allocations this step still needs.
+        ``span_bytes`` is the size of one chunk. Eviction is best-effort and
+        only takes store-pool objects that ``can_evict``. Returns how many
+        one-chunk allocations fit afterwards, summed across holes. A caller
+        that still cannot fit one request skips that store and does not copy
+        KV off the GPU.
+        """
+        if self.storage_manager is None:
+            return 0
+        backend = self.storage_manager.allocator_backend
+        ensure = getattr(backend, "ensure_free_chunks", None)
+        if not callable(ensure):
+            return 0
+        return int(ensure(num_chunks, need_bytes=need_bytes, span_bytes=span_bytes))
+
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def store(
@@ -428,6 +451,11 @@ class LMCacheEngine:
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
+        # The vLLM save path sets this after it has already counted aligned
+        # free slots. A failed allocate releases what this call already took
+        # and returns before any GPU-to-CPU copy. Other callers keep the
+        # partial-store behaviour.
+        drop_on_alloc_miss = bool(kwargs.pop("drop_on_alloc_miss", False))
 
         # Initialize num_to_store_tokens to avoid reference before assignment
         num_to_store_tokens = 0
@@ -509,12 +537,24 @@ class LMCacheEngine:
                 memory_obj = self.storage_manager.allocate(
                     kv_shapes,
                     kv_dtypes,
-                    busy_loop=self.config.get_extra_config_value(
-                        "force_store_wait", False
-                    ),
+                    eviction=not drop_on_alloc_miss,
+                    busy_loop=False
+                    if drop_on_alloc_miss
+                    else self.config.get_extra_config_value("force_store_wait", False),
                     fmt=self.fmt,
+                    purpose="store",
                 )
                 if memory_obj is None:
+                    if drop_on_alloc_miss:
+                        for held in memory_objs:
+                            held.ref_count_down()
+                        logger.warning(
+                            "Dropping KV for request %s before D2H; "
+                            "allocated %d chunks and the next one did not fit.",
+                            req_id,
+                            len(memory_objs),
+                        )
+                        return
                     logger.warning(
                         "Local cpu memory under pressure so"
                         " choosing to store only "
@@ -638,6 +678,7 @@ class LMCacheEngine:
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
+        drop_on_alloc_miss = bool(kwargs.pop("drop_on_alloc_miss", False))
 
         if mask is not None:
             num_to_store_tokens = torch.sum(mask).item()
@@ -707,10 +748,26 @@ class LMCacheEngine:
                 kv_dtype,
                 batch_size=self.num_layers,
                 fmt=self.fmt,
-                busy_loop=self.config.get_extra_config_value("force_store_wait", False),
+                eviction=not drop_on_alloc_miss,
+                busy_loop=False
+                if drop_on_alloc_miss
+                else self.config.get_extra_config_value("force_store_wait", False),
+                purpose="store",
             )
 
             if memory_objs_multi_layer is None:
+                if drop_on_alloc_miss:
+                    for layer_objs in memory_objs:
+                        for held in layer_objs:
+                            held.ref_count_down()
+                    memory_objs = []
+                    keys = []
+                    logger.warning(
+                        "Dropping layerwise KV for request %s before D2H; "
+                        "the next chunk did not fit.",
+                        req_id,
+                    )
+                    break
                 logger.warning(
                     "Local cpu memory under pressure so"
                     " choosing to not store the KV cache."
@@ -962,6 +1019,8 @@ class LMCacheEngine:
                     memory_obj.unpin()
                 memory_obj.ref_count_down()
 
+        self._drain_after_host_return()
+
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(
             retrieve_stats,
@@ -1133,6 +1192,8 @@ class LMCacheEngine:
         for mem_obj in to_count_down:
             if mem_obj.is_pinned:
                 mem_obj.unpin()
+
+        self._drain_after_host_return()
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
@@ -1351,6 +1412,7 @@ class LMCacheEngine:
         search_range: Optional[List[str]] = None,
         pin: bool = False,
         request_configs: Optional[dict] = None,
+        epoch: int = 0,
     ) -> None:
         """
         An async version of lookup + prefetch.
@@ -1361,6 +1423,9 @@ class LMCacheEngine:
         (3) async lookup + async retrieval (e.g., p2p)
         """
         assert self.storage_manager is not None
+        started = getattr(self.storage_manager, "note_tier_lookup_started", None)
+        if callable(started):
+            started(lookup_id, int(epoch))
 
         keys: list[CacheEngineKey] = []
         cum_chunk_lengths = [0]
@@ -1396,11 +1461,24 @@ class LMCacheEngine:
                 search_range,
                 pin,
                 keys_per_chunk=keys_per_chunk,
+                epoch=int(epoch),
             ),
             self.storage_manager.loop,
         )
 
-    def cleanup_memory_objs(self, lookup_id: str) -> None:
+    def _drain_after_host_return(self) -> None:
+        """Look at net free once after a prefetch body returns to the pool.
+
+        A disk GET pins a staging object that is not in the hot cache. Unpin
+        and ref_count_down hand those bytes back. One check covers the whole
+        prefix. Store eviction does not come through here.
+        """
+        storage = getattr(self, "storage_manager", None)
+        drain = getattr(storage, "_maybe_drain_on_net_free", None)
+        if callable(drain):
+            drain()
+
+    def cleanup_memory_objs(self, lookup_id: str, epoch: int = 0) -> None:
         """
         Cleanup memory objects allocated during prefetch for an aborted lookup.
 
@@ -1408,16 +1486,31 @@ class LMCacheEngine:
         has finished its prefetch tasks.
         """
         try:
-            # Get the completed future from event_manager
-            if (
-                self.event_manager.get_event_status(EventType.LOADING, lookup_id)
-                != EventStatus.DONE
-            ):
+            storage = getattr(self, "storage_manager", None)
+            abort = getattr(storage, "abort_tier_load", None) if storage else None
+            # A failed abort did not release the prefetch. Fall through to the
+            # event cleanup instead of leaving those pins held.
+            if callable(abort):
+                try:
+                    if abort(lookup_id, epoch):
+                        return
+                except Exception:
+                    logger.debug(
+                        "Tier abort failed for lookup_id=%s; releasing the prefetch.",
+                        lookup_id,
+                        exc_info=True,
+                    )
+            # One owner pops the future. A different epoch leaves it for the
+            # retrieve that was already admitted. No epoch on the future keeps
+            # the previous cleanup behavior.
+            future = self.event_manager.pop_event_if_done(
+                EventType.LOADING, lookup_id, epoch=int(epoch)
+            )
+            if future is None:
                 logger.debug(
                     "No completed event found for lookup_id=%s to clean up.", lookup_id
                 )
                 return
-            future = self.event_manager.pop_event(EventType.LOADING, lookup_id)
 
             # Get memory objects from the future result
             memory_objs = future.result()
@@ -1433,6 +1526,7 @@ class LMCacheEngine:
                     memory_obj.ref_count_down()
                 except Exception as e:
                     logger.error("Error releasing memory object: %s", e)
+            self._drain_after_host_return()
         except Exception as e:
             logger.error(
                 "Error during cleanup_memory_objs for lookup_id=%s: %s",
@@ -1570,12 +1664,9 @@ class LMCacheEngine:
             for location, keys in self.lookup_pins.pop(lookup_id).items():
                 self.storage_manager.batched_unpin(keys, [location])
 
-        elif (
-            self.async_loading is not None
-            and self.event_manager.get_event_status(EventType.LOADING, lookup_id)
-            != EventStatus.NOT_FOUND
-        ):
-            self.cleanup_memory_objs(lookup_id)
+        # A LOADING event still here belongs to a prefetch this step did not
+        # retrieve. wait_for_save runs after H2D and must not free those
+        # buffers. Abort releases them through cleanup_memory_objs.
 
     @_lmcache_nvtx_annotate
     def clear(
@@ -1686,9 +1777,15 @@ class LMCacheEngine:
 
         tot_kv_size = 0
         chunks: List[ProcessedChunk] = []
-        future = self.event_manager.get_event_future(
+        # Take the future before reading it. Cleanup of another epoch, or a
+        # cleanup that already popped it, must not free these buffers while
+        # H2D still uses them. A missing event is an empty hit.
+        future = self.event_manager.pop_event_if_done(
             EventType.LOADING, kwargs["req_id"]
         )
+        if future is None:
+            logger.warning("No completed prefetch for request %s", kwargs["req_id"])
+            return [], 0
         # As mentioned in async_lookup_and_prefetch(), the future.result()
         # is key data pair for each chunk in each tier. So extract the key
         # and memory object pairs to memory_obj_map

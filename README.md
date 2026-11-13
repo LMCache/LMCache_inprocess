@@ -1,5 +1,130 @@
 # LMCache InProcess
 
+## 2026-11-13 一次释放 prefetch 缓冲
+
+`20261113-134055` 的 800×3 在第一条 Turn3 的 H2D 上退出。调度器已经按 2048 token 命中排进这一步，`retrieve` 读到的 preload `MemoryObj.valid` 是 `False`，`_broadcast_or_receive_memory_objs` 里 `raw_tensor` 为 `None` 后断言。同一条 `LOADING` future 被释放了两次：`retrieve` 拷完之后减引用，`wait_for_save` 的 `lookup_unpin` 再走 `cleanup_memory_objs`。GET 已经结束时，过期 epoch 的 `LookupCleanupMsg` 也会把当前 future 弹出来释放。日志里有 4332 次引用被减到 -1，561 次完整的 `Retrieved 2048`。磁盘读失败是 0。
+
+`retrieve` 一开始就弹出 `DONE` 的 future，缺事件就当没有命中。`lookup_unpin` 不再释放这条 future。`cleanup_memory_objs` 只在 future 没有 epoch，或 epoch 与这次 cleanup 相同的时候弹出并释放。两处 gather 的 future 写上这次 lookup 的 epoch。读盘线程池和准入不改。没有新配置项。
+
+### 已完成
+- 一条 prefetch 只被弹出一次。成功的 H2D 由 `retrieve` 释放。
+- 过期 epoch 的 cleanup 留下已经收下的缓冲。
+- 测试覆盖 epoch 不同不释放、epoch 相同只释放一次，以及 retrieve 之后 `lookup_unpin` 不再把引用减成负数。
+
+### 已复测
+- 3090，AWQ，镜像 `vllm-openai:v0.33.0-lmcache0.5.7-pr9-a934ac8`（`sha256:f1c929922d5510df57d6e14e404771c637a6623236e05d27daf2b86590bc1d81`）。同一份 inprocess，两个开关开对关。`Double free`、引用为负、`AssertionError` 都是 0。800×3 戳 `20261113-155004`，综合 435.458 tok/s = (51112+34486+33654)/273.854。Turn1 176.603s，4.53 req/s，289.42 tok/s，51112 token，TTFT 均/中/P99 83803.76/84342.48/165150.74 ms。Turn2 53.864s，14.85 req/s，640.24 tok/s，34486 token，TTFT 80796.04/78487.49/139082.01 ms。Turn3 43.387s，18.44 req/s，775.67 tok/s，33654 token，TTFT 45380.16/46207.45/51073.26 ms。`wall_s=273.854`，重叠 204.368s / 106.745s。三轮 800/0。同协议原生开关关 `20261113-155725` 综合 427.905 tok/s = (51107+35852+35009)/285.035，`wall_s=285.035`。800×2 戳 `20261113-114125` 综合 395.024 tok/s = (51110+36186)/220.989，对原生 `20261112-115332` 的 393.420。这两档差在测量起伏里。800×4 本分支综合 442.524 tok/s = (51107+34980+32907+35058)/348.121。同次原生 `20261113-161309` 综合 340.471，盘读中位 12.7 ms，其余三场约 2.5 ms，不拿来当加速比。这台 3090 没有同协议的不存。
+- 物理机 RTX PRO 6000，FP16 `DeepSeek-V2-Lite-Chat`，vLLM 0.33.0，LMCache 0.5.7.post1。镜像 `vllm-openai:v0.33.0-lmcache0.5.7.post1-pr9-a934ac8`（`sha256:e8ad91be7d42e5d1ca35d79da300e5e57ae6d4b85a3e87274282c450a23ee05b`）。800 用户、rate 800、在线重叠、`max_model_len` 8192、`max_num_seqs` 128、`max_num_batched_tokens` 8192、KV HBM 12GiB、L1 20GiB（store `8589934592`、preload `12884901888`）。盘是 `/dev/sdb2` XFS `/mnt/xfs`，`max_local_disk_size` 100GiB。两个开关都开。原生是同一 post1、不覆盖 inprocess、`enable_async_loading` 默认关闭，镜像 `vllm-openai:v0.33.0-lmcache0.5.7.post1-src`（`sha256:8904a0363adcc214e59bbb6557bd644fdf08db84407d6ab4ce88fef473d21745`）。六场都是 800/0，`Double free` 为 0。吞吐差是整条加载路径对 stock 默认，不是这一次释放单独的乘数。
+- 800×2 本分支 `20261113-172403` 综合 967.2 tok/s = (50801+38471)/92.296。Turn1 57.349s，13.95 req/s，885.82 tok/s，50801 token，TTFT 均/中/P99 30130.35/30709.61/51130.22 ms。Turn2 34.947s，22.89 req/s，1100.83 tok/s，38471 token，TTFT 32538.73/32127.15/36302.62 ms。`wall_s=92.296`，重叠 76.898s。原生 `20261113-173613` 综合 388.7 tok/s = (50817+38740)/230.430。Turn1 105.082s，7.61 req/s，483.59 tok/s，50817 token，TTFT 31264.97/31724.76/55846.75 ms。Turn2 125.348s，6.38 req/s，309.06 tok/s，38740 token，TTFT 112230.12/121003.29/151511.49 ms。`wall_s=230.430`，重叠 216.266s。
+- 800×3 本分支 `20261113-174227` 综合 827.3 tok/s = (50910+38349+34199)/149.234。Turn1 62.164s，12.87 req/s，818.96 tok/s，50910 token，TTFT 31631.91/32486.43/55291.27 ms。Turn2 48.073s，16.64 req/s，797.73 tok/s，38349 token，TTFT 36533.63/35842.42/40619.89 ms。Turn3 38.997s，20.51 req/s，876.97 tok/s，34199 token，TTFT 38453.52/38162.48/40656.92 ms。`wall_s=149.234`，重叠 94.521s / 92.510s。原生 `20261113-174720` 综合 321.2 tok/s = (50813+38440+36915)/392.788。Turn1 110.856s，7.22 req/s，458.37 tok/s，50813 token，TTFT 34654.20/35114.27/58919.77 ms。Turn2 172.083s，4.65 req/s，223.38 tok/s，38440 token，TTFT 114573.07/123140.89/154082.78 ms。Turn3 109.850s，7.28 req/s，336.05 tok/s，36915 token，TTFT 127042.37/126365.92/150631.93 ms。`wall_s=392.788`，重叠 265.413s / 331.169s。
+- 800×4 本分支 `20261113-175615` 综合 867.1 tok/s = (50910+38894+36087+34400)/184.854。Turn1 59.091s，13.54 req/s，861.55 tok/s，50910 token，TTFT 31619.08/32083.64/53055.81 ms。Turn2 42.507s，18.82 req/s，915.01 tok/s，38894 token，TTFT 33223.98/32776.50/36854.76 ms。Turn3 48.278s，16.57 req/s，747.48 tok/s，36087 token，TTFT 35639.91/35464.73/39187.24 ms。Turn4 34.978s，22.87 req/s，983.46 tok/s，34400 token，TTFT 37866.49/37726.17/39243.58 ms。`wall_s=184.854`，重叠 84.442s / 95.536s / 98.268s。原生 `20261113-180149` 综合 285.2 tok/s = (50801+38906+36527+35442)/566.811。Turn1 111.456s，7.18 req/s，455.79 tok/s，50801 token，TTFT 33370.29/32342.85/59755.99 ms。Turn2 173.432s，4.61 req/s，224.33 tok/s，38906 token，TTFT 117228.87/126338.73/155924.74 ms。Turn3 173.643s，4.61 req/s，210.36 tok/s，36527 token，TTFT 131224.70/130457.55/152812.66 ms。Turn4 108.279s，7.39 req/s，327.32 tok/s，35442 token，TTFT 136155.19/137149.08/141619.58 ms。`wall_s=566.811`，重叠 269.466s / 396.177s / 345.859s。
+- 同一次 7962624 字节的 O_DIRECT，原生中位 62–74 ms，本分支 100–103 ms。原生读得更多：800×2 是 45.1GB 对 4.2GB，800×3 是 95.8GB 对 29.8GB，800×4 是 154.5GB 对 38.2GB。原生 CPU 分配失败分别是 9514、16688、24813；本分支是 0。文档里的物理机不存是另一口径（vLLM 0.15、rate 32、`max_model_len` 4096）：`20261002-120539` 综合 971.2，`20261002-161229` 综合 973.2。这张卡上没有同协议的历史 SurData 跑次。
+
+## 2026-11-12 读盘按 preload 空槽放行
+
+`20261112-151524` 第二轮 800 条索引都是 2048，调度器拿到 2048 的只有 342 条，457 条是 0。GET 的预算读的是 `memory_allocator`。20GiB 拆开之后这个对象是 store 池。申请发生在 preload 池。store 池腾出来之后，每一拍仍按那边的空闲字节再放行一批读，preload 里没有下一块就失败。
+
+`_host_free_bytes` 改为可分配块的字节。池拆开时读 preload 分配器：不小于一块的洞按块相加，小于一块的碎片算 0。`fits` 的比较式不变。store 池空着、preload 没有下一块时，这一拍不再放行。
+
+`batched_async_load_bytes_from_disk` 用已有的 `_read_thread_pool`（`disk_io_threads`，默认 4）同时读。读的时候不占 `disk_lock`。返回的是连续前缀：失败的那块释放，它后面已经读完的块也释放。8GiB / 12GiB、128 的信号量、store 池水位都不改。没有新配置项。
+
+### 已完成
+- 读盘预算按 preload 可分配块数。
+- 异步读盘同时最多 `disk_io_threads` 个。
+- 测试覆盖 store 被占满时预算仍看 preload，以及多块同时读、中间失败只保留前缀。
+
+### 已复测
+- 这段代码在 `a934ac8` 的镜像里。3090 和物理机的数字见 2026-11-13 那一节。没有另打一版只含这次提交的镜像。
+
+## 2026-11-12 按可分配块数回收 store 池
+
+`store()` 逐块申请。一块是对齐后的 chunk。几段各自装得下一块的洞，块数相加。小于一块的碎片算 0。`ensure_free_chunks` 在可分配块数少于这一拍的预算时继续驱逐 store 池里 `can_evict` 的对象，不再因为「原始空闲字节已经够、最长空段至少一块」就停。返回的是可分配块数。`wait_for_save` 用这个数扣每一条请求。在飞写和 pin 住的对象仍然不回收。32 块的步上限、8GiB / 12GiB 两池不变。
+
+`20261112-134737` 里有 50 步一进来最长空段是 7，2048 token 要 8 块，后面的请求被整条跳过，能驱逐的 KV 还留在池里。前 50 秒 `Stored` 约 230–330MiB/s，和每步 32 块的上限一致，不是盘写不及 3090。
+
+### 已完成
+- 水位按可分配块数继续驱逐，返回这个块数。
+- 入场按可分配块数扣减。一段 7 块不够 8 时会再腾。
+- 隔块的洞可以相加后做 8 次逐块申请。引用大于 1 和 preload 池的对象仍不回收。
+
+### 已复测
+- 镜像 `vllm-openai:v0.33.0-lmcache0.5.7-pr9-68fc63b`（`sha256:1933fe256a005c1ee23087e75c9e8f572088fffc5f97b8c1dbdeb7a849ac3339`）。三个文件的 md5 与本机 `68fc63b` 一致：`local_cpu_backend.py` `1f9d0ff2116c013fb2cabbe86051571b`，`cache_engine.py` `355ec1986d6c30c1ee6476bfea5ad0aa`，`vllm_v1_adapter.py` `3bfd4602b244a6844f21e14099306c48`。
+- 2026-11-12 15:15 在新 RTX 3090 上复测，戳 `20261112-151524`。盘是 `/dev/vdc` 上的 XFS，`file:///mnt/xfs/surdata-xfs/native/kvcache`。协议与 `20261112-134737` 相同：800×2、rate 800、`max_model_len` 8192、两个开关都开。综合 297.532 tok/s = (51076+34470)/287.519。Turn1 178.426s，4.48 req/s，286.26 tok/s，51076 token，TTFT 均/中/P99 84693.74/85068.14/167265.14 ms。Turn2 109.093s，7.33 req/s，315.97 tok/s，34470 token，TTFT 114661.94/111166.77/141156.55 ms。`wall_s=287.519`，重叠 261.217s。两轮 800/0。`EXIT_RC=0`。GPU 已放开。
+- 同机原生 LMCache+XFS `20261112-115332` 综合 393.420 tok/s。同协议历史最好仍是 `20261112-134737` 的 302.180 tok/s。这台 3090 没有「不存」跑次。
+- 这次 `Dropping KV` 是 0。Turn2 入场 2048×342、0×457、512×1。preload 池分不出连续块 458 次。
+
+## 2026-11-12 store 池和 preload 池
+
+`max_local_cpu_size` 正好是 20 时，默认的非分页 `MixedMemoryAllocator` 拆成两块。store 池 `8589934592`（8GiB），preload 池 `12884901888`（12GiB）。这两个数和 SurData 直连的 `STORE_POOL_DEFAULT` / `PRELOAD_POOL_DEFAULT` 相同，不从 `MemTotal`、`max_local_cpu_size` 或 OOM 日志推。没有新配置项。P2P、NIXL、io_uring，以及单测注入的小分配器，仍是一个分配器。只有一个分配器时 `purpose` 不起作用。
+
+D2H 的 `store` / `store_layer` 用 `purpose="store"`。回收只拿 store 池里 `can_evict` 的热缓存对象：没被 pin，且引用等于 1。正在写盘的对象引用大于 1，留在 store 池里。入场看的是能逐块申请的块数，见上一节。装不下的整条请求跳过，不调用 `batched_from_gpu`。`drop_on_alloc_miss` 时分配仍然 `eviction=False`。
+
+读盘三处用 `purpose="preload"`：`batched_get_non_blocking`、`batched_get_blocking`、`load_bytes_from_disk`。`busy_loop` 保持原来的值。preload 池分不出连续的一块时停在当前 key，不进 store 池去抢。
+
+### 已完成
+- 20GiB 默认分配器拆成 8GiB store 和 12GiB preload。
+- 当时水位在字节够且最长空段至少一块时停，入场看最长空段。停止条件已改成可分配块数，见上一节。
+- 读盘只从 preload 池申请。
+- `tests/inprocess/v1/test_local_cpu_pre_evict.py` 覆盖两池隔离、在飞写不回收、隔块洞相加、七块时继续驱逐。
+
+### 已复测
+- 两池拆分已打进镜像 `vllm-openai:v0.33.0-lmcache0.5.7-pr9-767b77b`，并跑过 `20261112-134737`。按块数回收的复测见上一节 `20261112-151524`。含这次提交的后续镜像见 2026-11-13。
+
+## 2026-11-12 写盘直接进线程池
+
+`submit_put_task` 不再把落盘协程交给 `storage-manager-event-loop`。`LocalDiskWorker.submit_put` 把 `async_save_bytes_to_disk` 直接提交给名为 `disk-put` 的 `ThreadPoolExecutor`，大小仍是已有的 `disk_io_threads`（默认 4）。预取还走原来的优先级队列。没有新配置项。
+
+`put_tasks` 从列表改成集合。登记、查找、删除都是 O(1)，不再在 `disk_lock` 里线性扫描在飞 key。`write_file` 抛错时减引用、从在飞集合去掉 key、退回这次加上的用量和 `current_cache_size`，不 `insert_key`。提交进线程池失败时同样减引用、去掉 key，并退回已经计入的 `current_cache_size`。
+
+### 已完成
+- 写盘直接进线程池。在飞 key 用集合。写失败释放引用和配额。
+- `tests/inprocess/v1/storage_backend/test_local_disk_put_admission.py` 覆盖 4 路同时停在 `write_file`，以及写失败后引用下降、key 不进 `dict`。
+
+### 已复测
+- 这段代码在 `a934ac8` 的镜像里。3090 和物理机的数字见 2026-11-13 那一节。没有另打一版只含这次提交的镜像。
+
+## 2026-11-11 对齐预算，腾不够就丢掉 KV
+
+预算和空闲槽都按对齐后的整块算。`aligned_savable_tokens` 与 `wait_for_save` 的实际写入对齐：`slot_mapping` 和 token 长度不一致算 0；`skip_leading_tokens` 向下对齐到 `chunk_size`；不是最后一段 prefill 且没开 blending 时，结尾也向下对齐。块数是 `savable // chunk_size`，尾巴不再 `ceil`。layerwise 一条 chunk 要 `num_layers` 个对象，槽位按这个倍数算，token 块数仍钳到 32。
+
+空闲槽用 `get_full_chunk_size_bytes()`（没有 metadata 时用已在池里的对象物理大小）再按 allocator 的 `align_bytes` 向上对齐。地址空闲链表里每个连续块贡献 `size // aligned`，小于一块的碎片算 0。`ensure_free_chunks` 只驱逐差额，一次 `batched_remove(force=False)`，pin 住的和在飞落盘不动，也不 sleep。返回值是驱逐之后的对齐空闲槽数。看不到空闲链表时返回 0。
+
+`wait_for_save` 先对整批 `lookup_unpin`，再预驱逐，再按请求扣槽。一条请求的块数大于剩余槽就打日志并跳过 `store`，不做 D2H。`save_kv_layer` 在第一次建 storer 之前同样先 unpin 再算槽，不够就不建 `store_layer`。`kv_consumer` 只 unpin、不存。这条路径的 `store` / `store_layer` 带 `drop_on_alloc_miss`：分配失败时把已经拿到的对象 `ref_count_down`，在 `batched_from_gpu` 之前返回，不再「失败一次、驱逐一个、再分配」。没有新配置项，`reserve_local_cpu_size` 和 SurData 直连池没有改。
+
+### 已完成
+- 预算按 chunk 对齐整除。空闲槽按对齐后的连续空闲块计数。腾不够就丢这条请求的 KV，不做 D2H。
+- 本机用 venv 的 torch 跑了 `tests/inprocess/v1/test_local_cpu_pre_evict.py`：7 项通过。覆盖对齐块数、碎片算 0、腾不出预算时返回的空闲槽小于预算、看不到空闲链表时返回 0。没有跑 800×2。
+
+### 已复测
+- 这段代码在 `a934ac8` 的镜像里。3090 和物理机的数字见 2026-11-13 那一节。没有另打一版只含这次提交的镜像。
+
+## 2026-11-11 batch 组建后预驱逐 20GiB local CPU 池
+
+`store` 逐 chunk 调用 `allocate`。20GiB pinned 池写满后，每次分配先失败再从 hot cache 驱逐 1 个，这段耗时记在 `offload_time` 里。`20261110-222612` 的后半段 offload 中位从 9.7 ms 升到 52.6 ms。落盘的 `put_time` 中位仍是 0.56 ms。
+
+上一节把「不够就退回逐 chunk 驱逐」改成了「腾不够就丢掉这条 KV」。这里留下当时的做法，方便对照。
+
+### 已完成
+- `chunks_for_save_batch`、`ensure_free_chunks`、`LMCacheEngine.pre_evict_for_save`。
+- `wait_for_save` 在非 layerwise 的 store 循环前调用一次。`save_kv_layer` 只在还没建过 layerwise storer 时调用一次。`kv_consumer` 和 engine 未初始化的分支不调用。
+- `get_size_bytes` 改到 `_chunk_size_bytes` 里再导入，store 预驱逐这条导入链不再去拉 vLLM KV format 注册表。
+
+### 已复测
+- 这段代码在 `a934ac8` 的镜像里。3090 和物理机的数字见 2026-11-13 那一节。没有另打一版只含这次提交的镜像。
+
+## 2026-11-10 没有 preloaded 且 HBM 有空就报 miss
+
+调度器侧 `TierAdmission` 相位是 `ready` 时，`get_num_new_matched_tokens` 仍返回 host 里已经有的 token 数，vLLM 按原路径把这段 KV 拷进 HBM。这一轮没有任何 `ready`，并且 vLLM 0.33 的 `scheduler.kv_cache_manager.block_pool.get_num_free_blocks()` 大于 0 时，`absent`、`pending`、`queued` 返回 `0`，GPU 重算。已经有别的 `ready`，或者读不到空闲块、空闲块是 0，这三种相位仍返回 `None`。`pending` 和 `queued` 被报成 miss 时调用已有的 `cancel_lookup`，迟到的 ACK 不能把相位改回去。
+
+### 已完成
+- `admission_tokens` 增加 `any_ready` 和 `hbm_free`。`TierAdmission.has_ready` 只在锁里看相位。`scheduler_hbm_has_free_block` 只认上面这个 v0.33.0 的取数函数，属性缺失或调用失败当成没有空块。
+- `on_vllm_schedule` 每轮读一次空闲块，记在 `_tier_hbm_free`。第一轮调度之前这个值是假。
+- 本机没有 `pytest` 和 `lmcache_native`。用导入替身跑了 `tests/inprocess/v1/test_tier_pipeline.py`：34 项里 17 项因缺少 `lmcache.lmcache_native` 跳过，其余 17 项通过，其中包括新的空 HBM 报 miss 和空闲块读取。没有跑 800×2。host 池大小没有改。
+
+### 已复测
+- 2026-11-10 22:26 复测，戳 `20261110-222612`。镜像 `vllm-openai:v0.33.0-lmcache0.5.7-pr9-3c3398a`，两个开关都开，盘是 `/mnt/xfs` 上的 XFS（`/mnt/xfs/surdata-xfs/native/kvcache`）。综合 408.5 tok/s = (51170+35114)/211.217。Turn1 163.82s，4.88 req/s，312.36 tok/s，51170 token，TTFT 均/中/P99 60744.88/53040.20/140117.97 ms。Turn2 47.40s，16.88 req/s，740.85 tok/s，35114 token，TTFT 96373.70/93858.72/129239.64 ms。`wall_s=211.217`，重叠 196.501s。两轮都是 800 成功、0 失败。`EXIT_RC=0`。比 `64a2a5d` 的 566.5 和原生 XFS 的 656.1 都低。含这次提交的后续镜像见 2026-11-13。
+
+
+
 `lmcache_inprocess` packages LMCache's legacy in-process engine separately from
 the main [LMCache](https://github.com/LMCache/LMCache) distribution. It keeps the
 existing Python import path, `lmcache.inprocess`, so current vLLM, TensorRT-LLM,

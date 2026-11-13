@@ -48,12 +48,18 @@ class LocalDiskWorker:
         self, loop: asyncio.AbstractEventLoop, max_workers: int = _DEFAULT_THREAD_COUNT
     ) -> None:
         self.put_lock = threading.Lock()
-        self.put_tasks: List[CacheEngineKey] = []
+        self.put_tasks: set[CacheEngineKey] = set()
 
         self.prefetch_lock = threading.Lock()
         self.prefetch_tasks: dict[CacheEngineKey, Future] = {}
 
         self.executor = AsyncPQThreadPoolExecutor(loop, max_workers=max_workers)
+        # Puts must not wait for the storage event loop to enter write().
+        # That loop runs one coroutine at a time; prefetch stays on it.
+        self._write_pool = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="disk-put",
+        )
         self.loop = loop
         self._closed = False
 
@@ -81,10 +87,34 @@ class LocalDiskWorker:
             **kwargs,
         )
 
+    def submit_put(self, fn: Callable, /, *args: Any, **kwargs: Any) -> None:
+        """Start a disk put on the write pool.
+
+        The caller does not wait. The pool size is ``disk_io_threads``.
+        A worker logs its own failure; an uncaught exception is also logged
+        from the Future so it is not dropped.
+
+        :param fn: Callable that performs the put.
+        :param args: Positional arguments for ``fn``.
+        :param kwargs: Keyword arguments for ``fn``.
+        :raises RuntimeError: The worker has already been closed.
+        """
+        if self._closed:
+            raise RuntimeError("LocalDiskWorker is closed")
+        future = self._write_pool.submit(fn, *args, **kwargs)
+        future.add_done_callback(self._log_write_future)
+
+    @staticmethod
+    def _log_write_future(future: Future) -> None:
+        try:
+            future.result()
+        except Exception:
+            logger.exception("Disk put task failed")
+
     def remove_put_task(self, key: CacheEngineKey):
         with self.put_lock:
             if key in self.put_tasks:
-                self.put_tasks.remove(key)
+                self.put_tasks.discard(key)
             else:
                 logger.warning("Key %s not found in put tasks.", key)
 
@@ -101,12 +131,12 @@ class LocalDiskWorker:
         with self.put_lock:
             if key in self.put_tasks:
                 return False
-            self.put_tasks.append(key)
+            self.put_tasks.add(key)
             return True
 
     def insert_put_task(self, key: CacheEngineKey):
         with self.put_lock:
-            self.put_tasks.append(key)
+            self.put_tasks.add(key)
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         with self.put_lock:
@@ -117,6 +147,7 @@ class LocalDiskWorker:
         if self._closed:
             return
         self._closed = True
+        self._write_pool.shutdown(wait=True)
         self.executor.shutdown(wait=True)
 
 
@@ -143,6 +174,9 @@ class LocalDiskBackend(StorageBackendInterface):
         self.local_cpu_backend = local_cpu_backend
 
         self.disk_lock = threading.Lock()
+        # Cap concurrent host GETs. A full CPU tier must not pile allocations
+        # onto the storage loop. 128 matches one scheduler window.
+        self._disk_prefetch_slots = asyncio.Semaphore(128)
 
         assert config.local_disk is not None
 
@@ -180,10 +214,8 @@ class LocalDiskBackend(StorageBackendInterface):
         self.disk_worker = LocalDiskWorker(loop, max_workers=thread_count)
 
         # Plain ThreadPoolExecutor for batched_get_blocking (concurrent
-        # synchronous reads).  The existing AsyncPQThreadPoolExecutor in
-        # disk_worker is async/priority-queue based and only serves writes
-        # and prefetches; a simple pool is a better fit for the blocking
-        # read path where we want ThreadPoolExecutor.map() semantics.
+        # synchronous reads). Puts use disk_worker's write pool. The
+        # priority-queue executor still serves prefetches.
         self._read_thread_pool = ThreadPoolExecutor(
             max_workers=thread_count,
             thread_name_prefix="disk-read",
@@ -429,16 +461,19 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.disk_worker.remove_put_task(key)
         memory_obj.ref_count_up()
 
-        asyncio.run_coroutine_threadsafe(
-            self.disk_worker.submit_task(
-                "put",
+        try:
+            self.disk_worker.submit_put(
                 self.async_save_bytes_to_disk,
                 key=key,
                 memory_obj=memory_obj,
                 on_complete_callback=on_complete_callback,
-            ),
-            self.loop,
-        )
+            )
+        except Exception:
+            logger.exception("Failed to submit disk put for key %s", key)
+            memory_obj.ref_count_down()
+            self.disk_worker.remove_put_task(key)
+            with self.disk_lock:
+                self.current_cache_size -= required_size
 
     # TODO(Jiayi): enable real batching
     def batched_submit_put_task(
@@ -534,7 +569,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
         # --- 2. Pre-allocate staging buffers (sequential) -----------------
         memory_objs = [
-            self.local_cpu_backend.allocate(m.shape, m.dtype, m.fmt)
+            self.local_cpu_backend.allocate(m.shape, m.dtype, m.fmt, purpose="preload")
             if m is not None
             else None
             for m in metas
@@ -603,60 +638,73 @@ class LocalDiskBackend(StorageBackendInterface):
     ) -> list[MemoryObj]:
         mem_objs: list[MemoryObj] = []
         paths: list[str] = []
+        prefix_keys: list[CacheEngineKey] = []
 
         logger.debug(
             "lookup_id: %s; Prefetching %s keys from disk.", lookup_id, len(keys)
         )
-        for key in keys:
-            self.disk_lock.acquire()
-            assert key in self.dict, f"Key {key} not found in disk cache after pinning"
+        slots = getattr(self, "_disk_prefetch_slots", None)
+        if slots is None:
+            slots = asyncio.Semaphore(128)
+            self._disk_prefetch_slots = slots
+        async with slots:
+            for key in keys:
+                memory_obj = None
+                with self.disk_lock:
+                    # A missing key means the index changed between lookup and
+                    # GET. That fails the read. An allocation miss is only a
+                    # shorter prefix, and the lock must not stay held.
+                    assert key in self.dict, (
+                        f"Key {key} not found in disk cache after pinning"
+                    )
+                    meta = self.dict[key]
+                    path = meta.path
+                    dtype = meta.dtype
+                    shape = meta.shape
+                    fmt = meta.fmt
+                    assert dtype is not None
+                    assert shape is not None
 
-            path = self.dict[key].path
-            dtype = self.dict[key].dtype
-            shape = self.dict[key].shape
-            fmt = self.dict[key].fmt
+                    # busy_loop=False prevents spinning on the event loop thread;
+                    # if staging memory is exhausted the caller will get a logged
+                    # error rather than a silent deadlock.
+                    memory_obj = self.local_cpu_backend.allocate(
+                        shape,
+                        dtype,
+                        fmt,
+                        busy_loop=False,
+                        purpose="preload",
+                    )
+                    if memory_obj is None:
+                        logger.error(
+                            "Memory allocation failed during async disk load for "
+                            "key %s. Preload pool has no contiguous chunk. "
+                            "Returning partial results.",
+                            key,
+                        )
+                    else:
+                        meta.pin()
+                        # NOTE(Jiayi): Currently, we consider prefetch as cache hit.
+                        # Update cache recency
+                        self.cache_policy.update_on_hit(key, self.dict)
+                if memory_obj is None:
+                    break
+                logger.debug("Prefetching %s from disk.", key)
+                memory_obj.pin()
+                mem_objs.append(memory_obj)
+                paths.append(path)
+                prefix_keys.append(key)
 
-            assert dtype is not None
-            assert shape is not None
+            if not mem_objs:
+                return []
 
-            # busy_loop=False prevents spinning on the event loop thread;
-            # if staging memory is exhausted the caller will get a logged
-            # error rather than a silent deadlock.
-            memory_obj = self.local_cpu_backend.allocate(
-                shape,
-                dtype,
-                fmt,
-                busy_loop=False,
+            return await self.disk_worker.submit_task(
+                "prefetch",
+                self.batched_async_load_bytes_from_disk,
+                paths=paths,
+                keys=prefix_keys,
+                memory_objs=mem_objs,
             )
-
-            if memory_obj is None:
-                logger.error(
-                    "Memory allocation failed during async disk load for key %s. "
-                    "CPU staging pool may be exhausted (unpin() not called after "
-                    "a previous retrieve). Returning partial results.",
-                    key,
-                )
-                return mem_objs
-
-            self.dict[key].pin()
-
-            # NOTE(Jiayi): Currently, we consider prefetch as cache hit.
-            # Update cache recency
-            self.cache_policy.update_on_hit(key, self.dict)
-
-            self.disk_lock.release()
-            logger.debug("Prefetching %s from disk.", key)
-            memory_obj.pin()
-            mem_objs.append(memory_obj)
-            paths.append(path)
-
-        return await self.disk_worker.submit_task(
-            "prefetch",
-            self.batched_async_load_bytes_from_disk,
-            paths=paths,
-            keys=keys,
-            memory_objs=mem_objs,
-        )
 
     async def batched_async_contains(
         self,
@@ -700,7 +748,17 @@ class LocalDiskBackend(StorageBackendInterface):
         self.stats_monitor.update_local_storage_usage(self.usage)
 
         # TODO(Jiayi): need to add ref count in disk memory object
-        self.write_file(buffer, path)
+        try:
+            self.write_file(buffer, path)
+        except Exception:
+            logger.exception("Disk put failed for key %s", key)
+            self.usage -= size
+            self.stats_monitor.update_local_storage_usage(self.usage)
+            with self.disk_lock:
+                self.current_cache_size -= memory_obj.get_physical_size()
+            memory_obj.ref_count_down()
+            self.disk_worker.remove_put_task(key)
+            return
 
         # ref count down here because there's a ref_count_up in
         # `submit_put_task` above.
@@ -727,6 +785,37 @@ class LocalDiskBackend(StorageBackendInterface):
                 logger.warning("on_complete_callback failed for key %s: %s", key, e)
 
     @_lmcache_nvtx_annotate
+    def _finish_prefetched_chunk(
+        self,
+        path: str,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+    ) -> Optional[MemoryObj]:
+        """Read one prefetched chunk. Safe to run on the disk-read pool.
+
+        The read itself does not hold ``disk_lock``. Metadata and the pin
+        taken before the read are updated under that lock. A failed read
+        drops the staging buffer and the pin, and returns ``None``.
+        """
+        try:
+            self.read_file(key, memory_obj.byte_array, path)
+        except Exception:
+            logger.exception("Disk read failed for key %s", key)
+            with self.disk_lock:
+                meta = self.dict.get(key)
+                if meta is not None:
+                    meta.unpin()
+            memory_obj.ref_count_down()
+            return None
+        with self.disk_lock:
+            meta = self.dict.get(key)
+            if meta is None:
+                memory_obj.ref_count_down()
+                return None
+            memory_obj.metadata.cached_positions = meta.cached_positions
+            meta.unpin()
+        return memory_obj
+
     def batched_async_load_bytes_from_disk(
         self,
         paths: list[str],
@@ -734,25 +823,33 @@ class LocalDiskBackend(StorageBackendInterface):
         memory_objs: list[MemoryObj],
         write_back: bool = False,
     ) -> list[MemoryObj]:
-        """
-        Async load bytearray from disk.
-        """
+        """Load prefetched chunks on the disk-read pool.
 
+        ``disk_io_threads`` workers read at once. The returned list is the
+        contiguous prefix: a failed chunk is released, and any chunk after
+        that hole is released too, even if its read finished.
+        """
+        del write_back
+        if not memory_objs:
+            return []
         logger.debug("Executing `async_load_bytes` from disk.")
-        # TODO (Jiayi): handle the case where loading fails.
-        for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
-            buffer = mem_obj.byte_array
-            self.read_file(key, buffer, path)
-
-            # TODO(Jiayi): Please recover the metadata in a more
-            # elegant way in the future.
-            cached_positions = self.dict[key].cached_positions
-            mem_obj.metadata.cached_positions = cached_positions
-
-            with self.disk_lock:
-                self.dict[key].unpin()
-
-        return memory_objs
+        loaded = list(
+            self._read_thread_pool.map(
+                self._finish_prefetched_chunk,
+                paths,
+                keys,
+                memory_objs,
+            )
+        )
+        prefix: list[MemoryObj] = []
+        for memory_obj in loaded:
+            if memory_obj is None:
+                break
+            prefix.append(memory_obj)
+        for memory_obj in loaded[len(prefix) :]:
+            if memory_obj is not None:
+                memory_obj.ref_count_down()
+        return prefix
 
     def load_bytes_from_disk(
         self,
@@ -766,7 +863,9 @@ class LocalDiskBackend(StorageBackendInterface):
         Load bytearray from disk.
         """
 
-        memory_obj = self.local_cpu_backend.allocate(shape, dtype, fmt)
+        memory_obj = self.local_cpu_backend.allocate(
+            shape, dtype, fmt, purpose="preload"
+        )
         assert memory_obj is not None, "Memory allocation failed during disk load."
 
         buffer = memory_obj.byte_array
