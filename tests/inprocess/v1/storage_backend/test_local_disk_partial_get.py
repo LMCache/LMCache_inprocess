@@ -3,20 +3,20 @@
 
 # Standard
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 import asyncio
 import threading
-from types import SimpleNamespace
 
 # Third Party
 import pytest
 import torch
 
 # First Party
-from lmcache.utils import CacheEngineKey, DiskCacheMetadata
-from lmcache.v1.memory_management import MemoryFormat
 from lmcache.inprocess.v1.storage_backend.local_disk_backend import (
     LocalDiskBackend,
 )
+from lmcache.utils import CacheEngineKey, DiskCacheMetadata
+from lmcache.v1.memory_management import MemoryFormat
 
 
 def _key(chunk_hash: int) -> CacheEngineKey:
@@ -55,7 +55,9 @@ class _CPU:
     def __init__(self, results: list) -> None:
         self._results = list(results)
 
-    def allocate(self, shape, dtype, fmt, busy_loop: bool = False, purpose: str = "store"):
+    def allocate(
+        self, shape, dtype, fmt, busy_loop: bool = False, purpose: str = "store"
+    ):
         del purpose
         assert busy_loop is False
         return self._results.pop(0)

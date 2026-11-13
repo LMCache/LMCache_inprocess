@@ -153,11 +153,7 @@ class EventManager:
             if future is None:
                 return None
             stamped = getattr(future, LOADING_EPOCH_ATTR, None)
-            if (
-                epoch is not None
-                and stamped is not None
-                and int(stamped) != int(epoch)
-            ):
+            if epoch is not None and stamped is not None and int(stamped) != int(epoch):
                 return None
             return done_events.pop(event_id)
 
