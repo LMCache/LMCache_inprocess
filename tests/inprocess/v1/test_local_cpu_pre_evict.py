@@ -250,6 +250,7 @@ def test_disk_budget_counts_preload_slots_not_store_free_bytes():
         assert backend.host_allocatable_bytes(chunk) == before
         store_obj.ref_count_down()
 
+        # Standard
         import sys
 
         pkg = sys.modules.get("lmcache.inprocess.v1.storage_backend")
@@ -258,6 +259,7 @@ def test_disk_budget_counts_preload_slots_not_store_free_bytes():
                 pkg.CreateStorageBackends = None
             if not hasattr(pkg, "is_cuda_worker"):
                 pkg.is_cuda_worker = lambda metadata: False
+        # First Party
         from lmcache.inprocess.v1.storage_backend.storage_manager import (
             StorageManager,
         )
@@ -293,9 +295,7 @@ def test_preload_allocate_does_not_shrink_the_store_pool():
     backend._split_pools = True
     try:
         before = backend._pool_free_stats(store, 4096)
-        memory_obj = backend.allocate(
-            _SHAPE, _DTYPE, eviction=False, purpose="preload"
-        )
+        memory_obj = backend.allocate(_SHAPE, _DTYPE, eviction=False, purpose="preload")
         assert memory_obj is not None
         assert getattr(memory_obj, "parent_allocator", None) is preload
         after = backend._pool_free_stats(store, 4096)
@@ -335,7 +335,9 @@ def test_store_watermark_does_not_evict_preload_objects():
         preload_obj.ref_count_down()
         backend.ensure_free_chunks(len(store_keys) + 1)
         assert preload_key in backend.hot_cache
-        assert getattr(backend.hot_cache[preload_key], "parent_allocator", None) is preload
+        assert (
+            getattr(backend.hot_cache[preload_key], "parent_allocator", None) is preload
+        )
     finally:
         store.close()
         preload.close()
@@ -347,9 +349,7 @@ def test_single_allocator_purpose_shares_the_pool():
     backend, allocator = _backend(1 << 20)
     try:
         before = backend._pool_free_stats(allocator, 4096)
-        memory_obj = backend.allocate(
-            _SHAPE, _DTYPE, eviction=False, purpose="preload"
-        )
+        memory_obj = backend.allocate(_SHAPE, _DTYPE, eviction=False, purpose="preload")
         assert memory_obj is not None
         after = backend._pool_free_stats(allocator, 4096)
         assert before is not None and after is not None

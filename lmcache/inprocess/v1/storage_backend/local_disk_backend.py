@@ -569,9 +569,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
         # --- 2. Pre-allocate staging buffers (sequential) -----------------
         memory_objs = [
-            self.local_cpu_backend.allocate(
-                m.shape, m.dtype, m.fmt, purpose="preload"
-            )
+            self.local_cpu_backend.allocate(m.shape, m.dtype, m.fmt, purpose="preload")
             if m is not None
             else None
             for m in metas

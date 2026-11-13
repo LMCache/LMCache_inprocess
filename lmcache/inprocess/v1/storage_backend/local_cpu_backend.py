@@ -163,6 +163,7 @@ def _chunk_size_bytes(shapes, dtypes) -> int:
     """Bytes of one KV chunk. Imported lazily so store pre-evict can load
     without the vLLM KV-format registry, which asks for native symbols.
     """
+    # First Party
     from lmcache.integration.vllm.utils import get_size_bytes
 
     return int(get_size_bytes(shapes, dtypes))
@@ -1208,7 +1209,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
                                 if (
                                     old_mem_obj is None
                                     or not old_mem_obj.can_evict
-                                    or not self._obj_in_allocator(old_mem_obj, allocator)
+                                    or not self._obj_in_allocator(
+                                        old_mem_obj, allocator
+                                    )
                                 ):
                                     old_mem_objs = []
                                     break

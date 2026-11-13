@@ -32,7 +32,7 @@ from lmcache import torch_dev, torch_device_type
 from lmcache.inprocess.observability import LMCacheStatsLogger, LMCStatsMonitor
 from lmcache.inprocess.usage_telemetry.context import InitializeUsageContext
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
-from lmcache.inprocess.v1.event_manager import EventManager, EventStatus, EventType
+from lmcache.inprocess.v1.event_manager import EventManager, EventType
 from lmcache.inprocess.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.inprocess.v1.gpu_connector.utils import assert_layerwise_gpu_connector
 from lmcache.inprocess.v1.hidden_state_store import HiddenStateStore
@@ -403,9 +403,7 @@ class LMCacheEngine:
         ensure = getattr(backend, "ensure_free_chunks", None)
         if not callable(ensure):
             return 0
-        return int(
-            ensure(num_chunks, need_bytes=need_bytes, span_bytes=span_bytes)
-        )
+        return int(ensure(num_chunks, need_bytes=need_bytes, span_bytes=span_bytes))
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -1786,9 +1784,7 @@ class LMCacheEngine:
             EventType.LOADING, kwargs["req_id"]
         )
         if future is None:
-            logger.warning(
-                "No completed prefetch for request %s", kwargs["req_id"]
-            )
+            logger.warning("No completed prefetch for request %s", kwargs["req_id"])
             return [], 0
         # As mentioned in async_lookup_and_prefetch(), the future.result()
         # is key data pair for each chunk in each tier. So extract the key
