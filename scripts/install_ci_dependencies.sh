@@ -35,7 +35,9 @@ echo "Installing LMCache dependency at ${upstream_revision}"
   "lmcache @ git+https://github.com/LMCache/LMCache.git@${upstream_revision}"
 
 echo "Installing the current lmcache_inprocess checkout"
-"${installer[@]}" --no-deps -e "${repo_root}"
+# A regular wheel overwrites the legacy inprocess tree bundled by older LMCache
+# versions; a PEP 660 editable finder loses to that existing package on sys.path.
+"${installer[@]}" --no-deps --force-reinstall "${repo_root}"
 
 "${python_bin}" - <<'PY'
 import lmcache
