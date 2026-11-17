@@ -67,7 +67,14 @@ class MockAsyncLookupServer:
     def __init__(self):
         self.responses = []
 
-    def send_response_to_scheduler(self, lookup_id: str, retrieved_length: int):
+    def send_response_to_scheduler(
+        self,
+        lookup_id: str,
+        retrieved_length: int,
+        kind: str = "",
+        epoch: int = 0,
+    ):
+        del kind, epoch
         self.responses.append((lookup_id, retrieved_length))
 
 
