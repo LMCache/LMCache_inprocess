@@ -24,17 +24,36 @@ import torch
 from lmcache.inprocess.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType
-from lmcache.v1.gpu_connector.utils import (
-    get_block_size,
-    get_dtype,
-    get_head_size,
-    get_hidden_dim_size,
-    get_num_blocks,
-    get_num_heads,
-    get_num_layers,
-    get_page_buffer_size,
-    normalize_kv_and_discover_format,
-)
+
+try:
+    # First Party
+    from lmcache.v1.gpu_connector.utils import (
+        get_block_size,
+        get_dtype,
+        get_head_size,
+        get_hidden_dim_size,
+        get_num_blocks,
+        get_num_heads,
+        get_num_layers,
+        get_page_buffer_size,
+        normalize_kv_and_discover_format,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.v1.gpu_connector.utils"}:
+        raise
+    from lmcache.v1.common.utils import (
+        get_block_size,
+        get_dtype,
+        get_head_size,
+        get_hidden_dim_size,
+        get_num_blocks,
+        get_num_heads,
+        get_num_layers,
+        get_page_buffer_size,
+        normalize_kv_and_discover_format,
+    )
+
+# First Party
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 import lmcache.lmcache_native as lmcache_native
 
