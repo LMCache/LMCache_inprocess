@@ -21,10 +21,11 @@ from transformers import AutoTokenizer
 import torch
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.utils import _lmcache_nvtx_annotate
 
 logger = init_logger(__name__)
 

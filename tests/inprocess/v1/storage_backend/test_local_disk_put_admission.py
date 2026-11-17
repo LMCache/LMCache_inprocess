@@ -9,11 +9,11 @@ import threading
 import torch
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.storage_backend.local_disk_backend import (
     LocalDiskBackend,
     LocalDiskWorker,
 )
-from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryObj
 
 

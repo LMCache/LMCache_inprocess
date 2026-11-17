@@ -53,12 +53,12 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey  # noqa: E402
 from lmcache.inprocess.v1.config import LMCacheEngineConfig  # noqa: E402
 from lmcache.inprocess.v1.metadata import LMCacheMetadata  # noqa: E402
 from lmcache.inprocess.v1.storage_backend.local_cpu_backend import (  # noqa: E402
     LocalCPUBackend,
 )
-from lmcache.utils import CacheEngineKey  # noqa: E402
 from lmcache.v1.memory_management import MemoryObj  # noqa: E402
 
 

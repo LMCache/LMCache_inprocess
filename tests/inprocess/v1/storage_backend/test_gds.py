@@ -13,6 +13,7 @@ import safetensors
 import torch
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.cache_engine import LMCacheEngineBuilder
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.memory_allocators.cu_file_memory_allocator import (
@@ -26,7 +27,6 @@ from lmcache.inprocess.v1.storage_backend.gds_backend import (
     pack_metadata,
     unpack_metadata,
 )
-from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryFormat
 
 

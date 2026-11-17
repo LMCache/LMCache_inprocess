@@ -31,6 +31,7 @@ import time
 import torch
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
 from lmcache.inprocess.v1.storage_backend.abstract_backend import (
@@ -43,7 +44,6 @@ from lmcache.inprocess.v1.storage_backend.plugins.rust_raw_block_backend import 
 )
 from lmcache.inprocess.v1.storage_backend.remote_backend import RemoteBackend
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_allocators.ad_hoc_memory_allocator import AdHocMemoryAllocator
 from lmcache.v1.memory_management import (
     MemoryAllocatorInterface,

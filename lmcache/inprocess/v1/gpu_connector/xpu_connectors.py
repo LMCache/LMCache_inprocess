@@ -12,14 +12,30 @@ from lmcache.inprocess.v1.gpu_connector.gpu_connectors import GPUConnectorInterf
 from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate
-from lmcache.v1.gpu_connector.utils import (
-    assert_is_vllm_flash_attn_or_flash_infer,
-    get_block_size,
-    get_elements_per_layer,
-    get_num_blocks,
-    get_tokens_per_layer,
-    normalize_kv_and_discover_format,
-)
+
+try:
+    # First Party
+    from lmcache.v1.gpu_connector.utils import (
+        assert_is_vllm_flash_attn_or_flash_infer,
+        get_block_size,
+        get_elements_per_layer,
+        get_num_blocks,
+        get_tokens_per_layer,
+        normalize_kv_and_discover_format,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.v1.gpu_connector.utils"}:
+        raise
+    from lmcache.v1.common.utils import (
+        assert_is_vllm_flash_attn_or_flash_infer,
+        get_block_size,
+        get_elements_per_layer,
+        get_num_blocks,
+        get_tokens_per_layer,
+        normalize_kv_and_discover_format,
+    )
+
+# First Party
 from lmcache.v1.memory_allocators.gpu_memory_allocator import GPUMemoryAllocator
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 import lmcache.lmcache_native as lmcache_native

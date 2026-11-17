@@ -14,6 +14,7 @@ import torch
 
 # First Party
 from lmcache.inprocess.observability import LMCStatsMonitor
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.health_monitor.base import HealthCheck
 from lmcache.inprocess.v1.health_monitor.constants import (
     DEFAULT_FALLBACK_POLICY,
@@ -33,7 +34,6 @@ from lmcache.inprocess.v1.storage_backend.connector.audit_connector import (
     AuditConnector,
 )
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
 
 if TYPE_CHECKING:
     # First Party

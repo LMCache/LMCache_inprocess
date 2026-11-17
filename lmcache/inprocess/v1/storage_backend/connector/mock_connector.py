@@ -9,6 +9,7 @@ from typing import List, Optional
 import asyncio
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.storage_backend.connector.base_connector import (
     RemoteConnector,
 )
@@ -17,7 +18,6 @@ from lmcache.inprocess.v1.storage_backend.job_executor.pq_executor import (
 )
 from lmcache.inprocess.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryObj, MemoryObjMetadata, TensorMemoryObj
 
 logger = init_logger(__name__)

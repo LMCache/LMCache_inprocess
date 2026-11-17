@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from concurrent.futures import Future
 
     # First Party
-    from lmcache.utils import CacheEngineKey
+    from lmcache.inprocess.utils import CacheEngineKey
     from lmcache.v1.memory_management import MemoryObj
 
 logger = init_logger(__name__)
