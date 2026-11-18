@@ -94,6 +94,22 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": _to_bool,
     },
     "max_local_cpu_size": {"type": float, "default": 5.0, "env_converter": float},
+    "store_admission_retry_ms": {
+        "type": int,
+        "default": 0,
+        "env_converter": int,
+        "description": (
+            "Maximum milliseconds to retry a store-side CPU memory "
+            "allocation (re-attempting eviction between retries) before "
+            "dropping the chunk. Useful under concurrent store pressure "
+            "when eviction candidates are temporarily pinned by in-flight "
+            "requests. Dropped chunks never reach any storage backend, and "
+            "lookups truncate at the first missing chunk. The retry window is "
+            "capped at 100 ms (larger values are clamped); small values of "
+            "tens of milliseconds are recommended in practice. Default is 0, "
+            "which drops immediately without retrying (previous behavior)."
+        ),
+    },
     "local_cpu_use_hugepages": {
         "type": bool,
         "default": False,
