@@ -15,8 +15,25 @@ from lmcache.inprocess.v1.storage_backend.legacy_serde.cachegen_basics import (
     CacheGenGPUEncoderOutput,
 )
 from lmcache.inprocess.v1.storage_backend.legacy_serde.serde import Deserializer
-from lmcache.logging import init_logger
-from lmcache.utils import _lmcache_nvtx_annotate
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    # First Party
+    from lmcache.v1.common.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.utils import _lmcache_nvtx_annotate
+except ImportError as exc:
+    if exc.name not in {"lmcache.utils"}:
+        raise
+    from lmcache.v1.common.decorators import _lmcache_nvtx_annotate
+
+# First Party
 import lmcache.inprocess.v1.storage_backend.legacy_serde.cachegen_basics as CGBasics
 
 logger = init_logger(__name__)

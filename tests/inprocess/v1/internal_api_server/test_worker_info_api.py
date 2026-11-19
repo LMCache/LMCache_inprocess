@@ -24,7 +24,15 @@ from lmcache.inprocess.v1.cache_controller.message import (
 )
 from lmcache.inprocess.v1.internal_api_server.api_server import app
 from lmcache.inprocess.v1.rpc_utils import get_zmq_context, get_zmq_socket
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    # First Party
+    from lmcache.v1.common.logging import init_logger
 
 logger = init_logger(__name__)
 

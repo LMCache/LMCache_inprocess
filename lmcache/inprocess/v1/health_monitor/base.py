@@ -14,15 +14,42 @@ from lmcache.inprocess.v1.health_monitor.constants import (
     DEFAULT_PING_INTERVAL,
     FallbackPolicy,
 )
-from lmcache.logging import init_logger
-from lmcache.v1.exceptions import IrrecoverableException
-from lmcache.v1.periodic_thread import (
-    PeriodicThread,
-    PeriodicThreadRegistry,
-    ThreadLevel,
-    ThreadRunSummary,
-)
-from lmcache.v1.utils.subclass_discovery import discover_subclasses
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    # First Party
+    from lmcache.v1.common.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.v1.exceptions import IrrecoverableException
+    from lmcache.v1.periodic_thread import (
+        PeriodicThread,
+        PeriodicThreadRegistry,
+        ThreadLevel,
+        ThreadRunSummary,
+    )
+    from lmcache.v1.utils.subclass_discovery import discover_subclasses
+except ImportError as exc:
+    if exc.name not in {
+        "lmcache.v1.exceptions",
+        "lmcache.v1.periodic_thread",
+        "lmcache.v1.utils.subclass_discovery",
+    }:
+        raise
+    # First Party
+    from lmcache.v1.common.errors import IrrecoverableException
+    from lmcache.v1.common.periodic_thread import (
+        PeriodicThread,
+        PeriodicThreadRegistry,
+        ThreadLevel,
+        ThreadRunSummary,
+    )
+    from lmcache.v1.common.subclass_discovery import discover_subclasses
 
 if TYPE_CHECKING:
     # First Party

@@ -10,8 +10,25 @@ from lmcache import device_ops
 from lmcache.inprocess.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.inprocess.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.integration.vllm.utils import ENGINE_NAME
-from lmcache.logging import init_logger
-from lmcache.utils import EngineType, _lmcache_nvtx_annotate
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    # First Party
+    from lmcache.v1.common.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.utils import EngineType, _lmcache_nvtx_annotate
+except ImportError as exc:
+    if exc.name not in {"lmcache.utils"}:
+        raise
+    # First Party
+    from lmcache.v1.common.custom_types import EngineType
+    from lmcache.v1.common.decorators import _lmcache_nvtx_annotate
 
 try:
     # First Party

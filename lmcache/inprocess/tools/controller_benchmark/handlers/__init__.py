@@ -5,8 +5,13 @@
 # Standard
 from typing import Dict
 
-# First Party
-from lmcache.v1.utils.subclass_discovery import discover_subclasses
+try:
+    # First Party
+    from lmcache.v1.utils.subclass_discovery import discover_subclasses
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.v1.utils.subclass_discovery"}:
+        raise
+    from lmcache.v1.common.subclass_discovery import discover_subclasses
 
 # Local
 from .base import OperationHandler

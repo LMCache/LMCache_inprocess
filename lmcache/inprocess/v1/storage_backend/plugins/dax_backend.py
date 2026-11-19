@@ -17,7 +17,16 @@ import threading
 from lmcache import device_ops
 from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.storage_backend.abstract_backend import StoragePluginInterface
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.v1.distributed.l2_adapters.dax.core import DaxCore
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 

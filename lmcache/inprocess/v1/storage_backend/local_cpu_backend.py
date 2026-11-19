@@ -28,8 +28,25 @@ from lmcache.inprocess.v1.storage_backend.batched_message_sender import (
 from lmcache.inprocess.v1.storage_backend.cache_policy import get_cache_policy
 from lmcache.inprocess.v1.system_detection import NUMADetector, SystemMemoryDetector
 from lmcache.integration.vllm.utils import get_size_bytes
-from lmcache.logging import init_logger
-from lmcache.utils import _lmcache_nvtx_annotate
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    # First Party
+    from lmcache.v1.common.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.utils import _lmcache_nvtx_annotate
+except ImportError as exc:
+    if exc.name not in {"lmcache.utils"}:
+        raise
+    from lmcache.v1.common.decorators import _lmcache_nvtx_annotate
+
+# First Party
 from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
 from lmcache.v1.memory_management import (
     MemoryAllocatorInterface,

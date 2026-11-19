@@ -24,7 +24,16 @@ from lmcache.inprocess.v1.storage_backend.job_executor.pq_executor import (
     AsyncPQExecutor,
 )
 from lmcache.inprocess.v1.storage_backend.local_cpu_backend import LocalCPUBackend
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.v1.memory_management import MemoryObj
 
 logger = init_logger(__name__)

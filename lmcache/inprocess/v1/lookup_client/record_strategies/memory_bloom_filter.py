@@ -2,7 +2,16 @@
 
 # First Party
 from lmcache.inprocess.v1.lookup_client.record_strategies.base import RecordStrategy
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.v1.utils.bloom_filter import BloomFilter
 
 logger = init_logger(__name__)

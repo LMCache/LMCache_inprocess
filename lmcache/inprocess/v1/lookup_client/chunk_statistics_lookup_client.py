@@ -11,7 +11,15 @@ from lmcache.inprocess.v1.lookup_client.record_strategies import (
     AsyncRecorder,
     create_record_strategy,
 )
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    # First Party
+    from lmcache.v1.common.logging import init_logger
 
 if TYPE_CHECKING:
     # Third Party

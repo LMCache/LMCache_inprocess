@@ -22,8 +22,24 @@ import torch
 
 # First Party
 from lmcache.inprocess.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
-from lmcache.logging import init_logger
-from lmcache.utils import EngineType
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    # First Party
+    from lmcache.v1.common.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.utils import EngineType
+except ImportError as exc:
+    if exc.name not in {"lmcache.utils"}:
+        raise
+    # First Party
+    from lmcache.v1.common.custom_types import EngineType
 
 try:
     # First Party

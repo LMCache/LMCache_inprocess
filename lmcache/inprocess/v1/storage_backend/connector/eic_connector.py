@@ -23,8 +23,25 @@ from lmcache.inprocess.v1.storage_backend.job_executor.pq_executor import (
     AsyncPQExecutor,
 )
 from lmcache.inprocess.v1.storage_backend.local_cpu_backend import LocalCPUBackend
-from lmcache.logging import init_logger
-from lmcache.utils import _lmcache_nvtx_annotate
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    # First Party
+    from lmcache.v1.common.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.utils import _lmcache_nvtx_annotate
+except ImportError as exc:
+    if exc.name not in {"lmcache.utils"}:
+        raise
+    from lmcache.v1.common.decorators import _lmcache_nvtx_annotate
+
+# First Party
 from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
 from lmcache.v1.memory_management import MemoryObj
 

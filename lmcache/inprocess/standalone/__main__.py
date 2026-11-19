@@ -35,8 +35,25 @@ from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.config_base import parse_command_line_extra_params
 from lmcache.inprocess.v1.gpu_connector import CreateGPUConnector
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
-from lmcache.logging import init_logger
-from lmcache.utils import EngineType
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    # First Party
+    from lmcache.v1.common.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.utils import EngineType
+except ImportError as exc:
+    if exc.name not in {"lmcache.utils"}:
+        raise
+    from lmcache.v1.common.custom_types import EngineType
+
+# First Party
 from lmcache.v1.kv_layer_groups import DEFAULT_LAYER_NAME_PREFIX
 
 # Third Party - Platform detection

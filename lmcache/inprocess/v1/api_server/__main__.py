@@ -59,7 +59,15 @@ from lmcache.inprocess.v1.cache_controller.message import (  # noqa: E501
 )
 from lmcache.inprocess.v1.config_base import parse_command_line_extra_params
 from lmcache.inprocess.v1.internal_api_server.api_registry import APIRegistry
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    # First Party
+    from lmcache.v1.common.logging import init_logger
 
 logger = init_logger(__name__)
 

@@ -7,8 +7,15 @@ import struct
 # Third Party
 import torch
 
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
 # First Party
-from lmcache.logging import init_logger
 from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.protocol import DTYPE_TO_INT, INT_TO_DTYPE
 

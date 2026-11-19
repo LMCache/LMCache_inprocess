@@ -12,7 +12,15 @@ import torch
 # First Party
 from lmcache.inprocess.v1.config import _CONFIG_DEFINITIONS, LMCacheEngineConfig
 from lmcache.inprocess.v1.config_base import validate_and_set_config_value
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    # First Party
+    from lmcache.v1.common.logging import init_logger
 
 logger = init_logger(__name__)
 

@@ -26,7 +26,16 @@ import prometheus_client
 
 # First Party
 from lmcache.inprocess.usage_telemetry.continuous import ContinuousUsageContext
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.utils import thread_safe
 
 if TYPE_CHECKING:
