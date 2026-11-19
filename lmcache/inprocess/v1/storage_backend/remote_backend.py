@@ -23,7 +23,16 @@ from lmcache.inprocess.v1.storage_backend.local_cpu_backend import LocalCPUBacke
 from lmcache.inprocess.v1.storage_backend.naive_serde import CreateSerde
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
-from lmcache.v1.exceptions import IrrecoverableException
+
+try:
+    # First Party
+    from lmcache.v1.exceptions import IrrecoverableException
+except ImportError as exc:
+    if exc.name not in {"lmcache.v1.exceptions"}:
+        raise
+    from lmcache.v1.common.errors import IrrecoverableException
+
+# First Party
 from lmcache.v1.memory_management import MemoryObj
 
 logger = init_logger(__name__)

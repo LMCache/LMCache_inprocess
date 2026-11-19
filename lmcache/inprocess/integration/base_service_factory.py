@@ -108,10 +108,21 @@ class BaseServiceFactory(ABC):
         """
         # First Party
         from lmcache.inprocess.observability import PrometheusLogger
-        from lmcache.v1.periodic_thread import (
-            PeriodicThreadRegistry,
-            ThreadLevel,
-        )
+
+        try:
+            # First Party
+            from lmcache.v1.periodic_thread import (
+                PeriodicThreadRegistry,
+                ThreadLevel,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"lmcache.v1.periodic_thread"}:
+                raise
+            # First Party
+            from lmcache.v1.common.periodic_thread import (
+                PeriodicThreadRegistry,
+                ThreadLevel,
+            )
 
         ping_interval = config.get_extra_config_value(
             PING_INTERVAL_CONFIG_KEY, DEFAULT_PING_INTERVAL

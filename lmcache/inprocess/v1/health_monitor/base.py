@@ -15,13 +15,28 @@ from lmcache.inprocess.v1.health_monitor.constants import (
     FallbackPolicy,
 )
 from lmcache.logging import init_logger
-from lmcache.v1.exceptions import IrrecoverableException
-from lmcache.v1.periodic_thread import (
-    PeriodicThread,
-    PeriodicThreadRegistry,
-    ThreadLevel,
-    ThreadRunSummary,
-)
+
+try:
+    # First Party
+    from lmcache.v1.exceptions import IrrecoverableException
+    from lmcache.v1.periodic_thread import (
+        PeriodicThread,
+        PeriodicThreadRegistry,
+        ThreadLevel,
+        ThreadRunSummary,
+    )
+except ImportError as exc:
+    if exc.name not in {"lmcache.v1.exceptions", "lmcache.v1.periodic_thread"}:
+        raise
+    from lmcache.v1.common.errors import IrrecoverableException
+    from lmcache.v1.common.periodic_thread import (
+        PeriodicThread,
+        PeriodicThreadRegistry,
+        ThreadLevel,
+        ThreadRunSummary,
+    )
+
+# First Party
 from lmcache.v1.utils.subclass_discovery import discover_subclasses
 
 if TYPE_CHECKING:
