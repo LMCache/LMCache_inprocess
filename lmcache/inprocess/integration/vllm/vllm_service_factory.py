@@ -34,7 +34,16 @@ from lmcache.inprocess.v1.lookup_client.abstract_client import (
 )
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
 from lmcache.inprocess.v1.offload_server.zmq_server import ZMQOffloadServer
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.v1.plugin.runtime_plugin_launcher import RuntimePluginLauncher
 
 logger = init_logger(__name__)

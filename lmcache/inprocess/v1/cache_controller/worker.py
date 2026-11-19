@@ -51,7 +51,16 @@ from lmcache.inprocess.v1.rpc_utils import (
     get_zmq_socket,
     get_zmq_socket_with_timeout,
 )
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.v1.rpc_utils import get_ip
 
 if TYPE_CHECKING:

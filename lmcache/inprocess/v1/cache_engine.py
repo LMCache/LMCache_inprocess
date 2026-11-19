@@ -48,7 +48,16 @@ from lmcache.inprocess.v1.token_database import (
     SegmentTokenDatabase,
     TokenDatabase,
 )
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.utils import (
     CacheStoreEvent,
     _lmcache_nvtx_annotate,

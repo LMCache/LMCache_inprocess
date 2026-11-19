@@ -11,7 +11,16 @@ from lmcache.inprocess.v1.gpu_connector.gpu_connectors import (
     GPUConnectorInterface,
     VLLMPagedMemGPUConnectorV2,
 )
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.utils import EngineType
 
 try:

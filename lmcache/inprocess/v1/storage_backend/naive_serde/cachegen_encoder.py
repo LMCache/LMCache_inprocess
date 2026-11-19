@@ -13,7 +13,16 @@ from lmcache.inprocess.v1.storage_backend.naive_serde.cachegen_basics import (
     CacheGenConfig,
 )
 from lmcache.inprocess.v1.storage_backend.naive_serde.serde import Serializer
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.gpu_connector.gpu_ops import lmcache_memcpy_async_h2d
 from lmcache.v1.memory_allocators.lazy_memory_allocator import LazyMemoryAllocator

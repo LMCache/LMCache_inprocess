@@ -6,8 +6,15 @@ import time
 # Third Party
 import torch
 
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
 # First Party
-from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 
 logger = init_logger(__name__)

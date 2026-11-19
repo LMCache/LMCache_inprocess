@@ -17,7 +17,16 @@ import threading
 
 # First Party
 from lmcache.inprocess.usage_telemetry.messages import EngineMessage, MetadataMessage
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.usage_telemetry.base import UsageContextBase
 from lmcache.usage_telemetry.env_probe import collect_env_message
 from lmcache.usage_telemetry.guard import swallow_telemetry_errors

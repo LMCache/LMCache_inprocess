@@ -9,8 +9,13 @@ import threading
 from fastapi import FastAPI
 import uvicorn
 
-# First Party
-from lmcache.logging import init_logger
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
 
 # Local
 from .api_registry import APIRegistry

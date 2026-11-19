@@ -39,7 +39,16 @@ from lmcache.inprocess.integration.tensorrt_llm.utils import (
 from lmcache.inprocess.utils import mock_up_broadcast_fn, mock_up_broadcast_object_fn
 from lmcache.inprocess.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.inprocess.v1.gpu_connector import CreateGPUConnector
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.utils import EngineType
 
 logger = init_logger(__name__)

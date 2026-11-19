@@ -25,7 +25,16 @@ from lmcache.inprocess.v1.rpc_utils import (
     get_zmq_context,
     get_zmq_socket,
 )
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.v1.rpc_utils import get_ip
 
 from lmcache.inprocess.v1.cache_controller.message import (  # isort: skip

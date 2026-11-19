@@ -43,7 +43,16 @@ from lmcache.inprocess.v1.storage_backend.plugins.rust_raw_block_backend import 
     RustRawBlockBackend,
 )
 from lmcache.inprocess.v1.storage_backend.remote_backend import RemoteBackend
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.v1.memory_allocators.ad_hoc_memory_allocator import AdHocMemoryAllocator
 from lmcache.v1.memory_management import (
     MemoryAllocatorInterface,

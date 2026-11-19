@@ -55,7 +55,16 @@ from lmcache.inprocess.v1.compute.blend import LMCBlenderBuilder
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.config_base import validate_and_set_config_value
 from lmcache.inprocess.v1.manager import LMCacheManager
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
 
 if TYPE_CHECKING:

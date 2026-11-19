@@ -34,7 +34,16 @@ from lmcache.inprocess.v1.storage_backend.abstract_backend import (
     AllocatorBackendInterface,
 )
 from lmcache.inprocess.v1.storage_backend.path_sharder import PathSharder
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.utils import (
     DiskCacheMetadata,
     _lmcache_nvtx_annotate,

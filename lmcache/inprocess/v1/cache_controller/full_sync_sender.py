@@ -15,7 +15,15 @@ from lmcache.inprocess.v1.cache_controller.message import (
     FullSyncStatusMsg,
     FullSyncStatusRetMsg,
 )
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    # First Party
+    from lmcache.v1.common.logging import init_logger
 
 if TYPE_CHECKING:
     # First Party
