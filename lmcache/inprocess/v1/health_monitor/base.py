@@ -25,9 +25,15 @@ try:
         ThreadLevel,
         ThreadRunSummary,
     )
+    from lmcache.v1.utils.subclass_discovery import discover_subclasses
 except ImportError as exc:
-    if exc.name not in {"lmcache.v1.exceptions", "lmcache.v1.periodic_thread"}:
+    if exc.name not in {
+        "lmcache.v1.exceptions",
+        "lmcache.v1.periodic_thread",
+        "lmcache.v1.utils.subclass_discovery",
+    }:
         raise
+    # First Party
     from lmcache.v1.common.errors import IrrecoverableException
     from lmcache.v1.common.periodic_thread import (
         PeriodicThread,
@@ -35,9 +41,7 @@ except ImportError as exc:
         ThreadLevel,
         ThreadRunSummary,
     )
-
-# First Party
-from lmcache.v1.utils.subclass_discovery import discover_subclasses
+    from lmcache.v1.common.subclass_discovery import discover_subclasses
 
 if TYPE_CHECKING:
     # First Party

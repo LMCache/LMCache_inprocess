@@ -19,7 +19,15 @@ from lmcache.inprocess.v1.storage_backend.connector.instrumented_connector impor
 )
 from lmcache.inprocess.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.logging import init_logger
-from lmcache.v1.utils.subclass_discovery import discover_subclasses
+
+try:
+    # First Party
+    from lmcache.v1.utils.subclass_discovery import discover_subclasses
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.v1.utils.subclass_discovery"}:
+        raise
+    # First Party
+    from lmcache.v1.common.subclass_discovery import discover_subclasses
 
 logger = init_logger(__name__)
 

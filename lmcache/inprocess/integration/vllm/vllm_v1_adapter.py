@@ -29,7 +29,16 @@ import torch
 # Use LMCache's own math utilities instead of vllm's
 # (avoids dependency on vllm internal changes like https://github.com/vllm-project/vllm/pull/27188)
 from lmcache import utils
-from lmcache.banner import print_banner_once
+
+try:
+    # First Party
+    from lmcache.banner import print_banner_once
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.banner"}:
+        raise
+    from lmcache.v1.common.banner import print_banner_once
+
+# First Party
 from lmcache.inprocess.integration.vllm.utils import (
     ENGINE_NAME,
     apply_mm_hashes_to_token_ids,
