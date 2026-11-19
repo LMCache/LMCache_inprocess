@@ -45,10 +45,17 @@ except ModuleNotFoundError as exc:
     from lmcache.v1.common.logging import init_logger
 
 # First Party
-from lmcache.utils import (
-    _lmcache_nvtx_annotate,
-    start_loop_in_thread_with_exceptions,
-)
+from lmcache.utils import start_loop_in_thread_with_exceptions
+
+try:
+    # First Party
+    from lmcache.utils import _lmcache_nvtx_annotate
+except ImportError as exc:
+    if exc.name not in {"lmcache.utils"}:
+        raise
+    from lmcache.v1.common.decorators import _lmcache_nvtx_annotate
+
+# First Party
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,

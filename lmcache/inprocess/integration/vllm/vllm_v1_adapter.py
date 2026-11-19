@@ -65,7 +65,17 @@ except ModuleNotFoundError as exc:
     from lmcache.v1.common.logging import init_logger
 
 # First Party
-from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
+from lmcache.utils import cdiv
+
+try:
+    # First Party
+    from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate
+except ImportError as exc:
+    if exc.name not in {"lmcache.utils"}:
+        raise
+    # First Party
+    from lmcache.integration.vllm.utils import CacheStoreEvent
+    from lmcache.v1.common.decorators import _lmcache_nvtx_annotate
 
 if TYPE_CHECKING:
     # Third Party

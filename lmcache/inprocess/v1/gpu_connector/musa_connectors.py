@@ -18,10 +18,17 @@ try:
 except ModuleNotFoundError as exc:
     if exc.name not in {"lmcache.logging"}:
         raise
+    # First Party
     from lmcache.v1.common.logging import init_logger
 
-# First Party
-from lmcache.utils import EngineType
+try:
+    # First Party
+    from lmcache.utils import EngineType
+except ImportError as exc:
+    if exc.name not in {"lmcache.utils"}:
+        raise
+    # First Party
+    from lmcache.v1.common.custom_types import EngineType
 
 try:
     # First Party

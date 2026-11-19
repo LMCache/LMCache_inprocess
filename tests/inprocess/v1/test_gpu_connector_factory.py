@@ -12,7 +12,16 @@ import torch
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.gpu_connector import CreateGPUConnector
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
-from lmcache.utils import EngineType
+
+try:
+    # First Party
+    from lmcache.utils import EngineType
+except ImportError as exc:
+    if exc.name not in {"lmcache.utils"}:
+        raise
+    from lmcache.v1.common.custom_types import EngineType
+
+# First Party
 import lmcache.inprocess.v1.gpu_connector as gpu_connector_module
 
 pytestmark = pytest.mark.musa

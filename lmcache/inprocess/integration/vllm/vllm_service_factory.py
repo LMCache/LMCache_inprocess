@@ -194,7 +194,15 @@ class VllmServiceFactory(BaseServiceFactory):
         # First Party
         from lmcache.inprocess.integration.vllm.utils import ENGINE_NAME
         from lmcache.inprocess.v1.gpu_connector import CreateGPUConnector
-        from lmcache.utils import EngineType
+
+        try:
+            # First Party
+            from lmcache.utils import EngineType
+        except ImportError as exc:
+            if exc.name not in {"lmcache.utils"}:
+                raise
+            # First Party
+            from lmcache.v1.common.custom_types import EngineType
 
         if curr_engine := LMCacheEngineBuilder.get(ENGINE_NAME):
             self.lmcache_engine = curr_engine

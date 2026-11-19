@@ -12,10 +12,17 @@ try:
 except ModuleNotFoundError as exc:
     if exc.name not in {"lmcache.logging"}:
         raise
+    # First Party
     from lmcache.v1.common.logging import init_logger
 
-# First Party
-from lmcache.utils import _lmcache_nvtx_annotate
+try:
+    # First Party
+    from lmcache.utils import _lmcache_nvtx_annotate
+except ImportError as exc:
+    if exc.name not in {"lmcache.utils"}:
+        raise
+    # First Party
+    from lmcache.v1.common.decorators import _lmcache_nvtx_annotate
 
 logger = init_logger(__name__)
 
