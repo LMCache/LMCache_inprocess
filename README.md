@@ -1,5 +1,12 @@
 # LMCache InProcess
 
+## 2026-11-21 LMCache dev 烟雾测试
+
+上游 `main` 已把 `kv_format` 迁到 `lmcache.v1.common`。`Smoke (3.12, dev)` 在收集 `tests/smoke` 时因旧路径导入失败。`gpu_connectors.py` 与 `musa_connectors.py` 按上游写法在 `ModuleNotFoundError` 时改从 `common.kv_format` / `common.utils` 导入。提交 `b42a998`，已推到 PR #35 分支。
+
+### 已完成
+- dev 矩阵的导入兼容，与上游 `LMCache_inprocess` `main` 一致。
+
 ## 2026-11-13 一次释放 prefetch 缓冲
 
 `20261113-134055` 的 800×3 在第一条 Turn3 的 H2D 上退出。调度器已经按 2048 token 命中排进这一步，`retrieve` 读到的 preload `MemoryObj.valid` 是 `False`，`_broadcast_or_receive_memory_objs` 里 `raw_tensor` 为 `None` 后断言。同一条 `LOADING` future 被释放了两次：`retrieve` 拷完之后减引用，`wait_for_save` 的 `lookup_unpin` 再走 `cleanup_memory_objs`。GET 已经结束时，过期 epoch 的 `LookupCleanupMsg` 也会把当前 future 弹出来释放。日志里有 4332 次引用被减到 -1，561 次完整的 `Retrieved 2048`。磁盘读失败是 0。
