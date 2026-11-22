@@ -1767,12 +1767,11 @@ class LMCacheConnectorV1Impl:
                 # Old version with resumed_from_preemption
                 preempted = cached_reqs.resumed_from_preemption[i]
             else:
-                # This case should not be reached with supported vLLM versions.
-                # Raising an error is safer than assuming not preempted.
-                raise AttributeError(
-                    f"Unable to determine preemption status for request {req_id}. "
-                    f"This might be due to an unsupported vLLM version."
-                )
+                # vLLM >= 0.34 (vllm-project/vllm#63373) has neither field: a
+                # resumed request is re-sent in full through
+                # ``scheduled_new_reqs``, where it gets a fresh tracker, so a
+                # cached request is never a resumed one.
+                preempted = False
             if preempted:
                 assert load_spec is not None, (
                     f"Request {req_id} is preempted but was not given a load spec"
