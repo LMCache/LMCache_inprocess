@@ -65,6 +65,14 @@ class RESPConnector(RemoteConnector):
 
         self.client = RESPClient(host, port, num_threads, loop, username, password)
         self.pq_executor = AsyncPQExecutor(loop)
+        # With remote_prefetch_write_back the local CPU backend is full by
+        # design. A prefetch must then not wait for memory: it runs on the
+        # storage event loop, and the wait would stall every lookup.
+        self._prefetch_waits_for_memory = not bool(
+            local_cpu_backend.config.get_extra_config_value(
+                "remote_prefetch_write_back", False
+            )
+        )
 
     async def _exists(self, key: CacheEngineKey) -> bool:
         return await self.client.exists(key.to_string())
@@ -138,17 +146,23 @@ class RESPConnector(RemoteConnector):
         return True
 
     async def _batched_get(
-        self, keys: List[CacheEngineKey]
+        self, keys: List[CacheEngineKey], wait_for_memory: bool = True
     ) -> List[Optional[MemoryObj]]:
         key_strs = [key.to_string() for key in keys]
-        memory_objs = [
-            self.local_cpu_backend.allocate(
+        memory_objs: List[MemoryObj] = []
+        for _ in keys:
+            memory_obj = self.local_cpu_backend.allocate(
                 self.meta_shapes,
                 self.meta_dtypes,
                 self.meta_fmt,
+                busy_loop=wait_for_memory,
             )
-            for _ in keys
-        ]
+            if memory_obj is None:
+                # No memory without waiting: a miss for the whole batch.
+                for allocated in memory_objs:
+                    allocated.ref_count_down()
+                return [None] * len(keys)
+            memory_objs.append(memory_obj)
         recv_bufs = [
             memory_obj.byte_array
             if isinstance(memory_obj.byte_array, memoryview)
@@ -225,7 +239,10 @@ class RESPConnector(RemoteConnector):
     ) -> List[MemoryObj]:
         # prefetch priority
         return await self.pq_executor.submit_job(
-            self._batched_get, keys=keys, priority=Priorities.PREFETCH
+            self._batched_get,
+            keys=keys,
+            wait_for_memory=self._prefetch_waits_for_memory,
+            priority=Priorities.PREFETCH,
         )
 
     # TODO
