@@ -28,6 +28,9 @@ from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
 from lmcache.inprocess.v1.storage_backend import LocalCPUBackend
 from lmcache.inprocess.v1.storage_backend.connector import CreateConnector
+from lmcache.inprocess.v1.storage_backend.job_executor.pq_executor import (
+    AsyncPQExecutor,
+)
 from lmcache.v1.memory_allocators.pin_memory_allocator import PinMemoryAllocator
 from tests.inprocess.conftest import MockRESPClient
 from tests.inprocess.utils import (
@@ -302,6 +305,125 @@ def test_resp_connector_batch_operations(
         assert len(retrieved_objs) == num_keys
         check_mem_obj_equal(retrieved_objs, memory_objs)
 
+    finally:
+        close_asyncio_loop(async_loop, async_thread)
+
+
+def _abandon_prefetch(connector, keys, async_loop, async_thread, prepare=None):
+    """Start a prefetch, let its caller time out, then let the job finish.
+
+    The remote read is held back until the caller has given up. ``prepare``
+    runs on the loop before the prefetch is submitted; without it the caller
+    gives up only once the read has started. Returns the chunks the connector
+    allocated.
+    """
+    # CreateConnector wraps the RESP connector for metrics.
+    resp_connector = connector._connector
+    local_backend = resp_connector.local_cpu_backend
+    allocated = []
+    real_allocate = local_backend.allocate
+
+    def recording_allocate(*args, **kwargs):
+        memory_obj = real_allocate(*args, **kwargs)
+        allocated.append(memory_obj)
+        return memory_obj
+
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    real_batch_get = resp_connector.client.batch_get
+
+    async def held_batch_get(key_strs, bufs):
+        read_started.set()
+        await release_read.wait()
+        return await real_batch_get(key_strs, bufs)
+
+    async def scenario():
+        if prepare is not None:
+            await prepare()
+        waiter = asyncio.ensure_future(
+            connector.batched_get_non_blocking("lookup", keys)
+        )
+        if prepare is None:
+            await asyncio.wait_for(read_started.wait(), 5.0)
+        with pytest.raises(asyncio.TimeoutError):
+            # RemoteBackend.batched_get_non_blocking waits the same way.
+            await asyncio.wait_for(waiter, 0.05)
+        release_read.set()
+        # Let the queued job run to its end.
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+
+    with (
+        patch.object(local_backend, "allocate", recording_allocate),
+        patch.object(resp_connector.client, "batch_get", held_batch_get),
+    ):
+        future = asyncio.run_coroutine_threadsafe(scenario(), async_loop)
+        _wait_for_future(future, "abandoned prefetch", async_loop, async_thread)
+    return allocated
+
+
+def _store_chunks(connector, local_backend, keys, async_loop, async_thread):
+    memory_objs = []
+    for _ in keys:
+        memory_obj = local_backend.allocate(
+            torch.Size([2, 32, 256, 1024]), torch.bfloat16
+        )
+        memory_obj.ref_count_up()
+        memory_objs.append(memory_obj)
+    future = asyncio.run_coroutine_threadsafe(
+        connector.batched_put(keys, memory_objs), async_loop
+    )
+    _wait_for_future(future, "batched_put", async_loop, async_thread)
+
+
+def test_resp_prefetch_releases_chunks_after_caller_timeout(
+    resp_url, local_backend, resp_config
+):
+    """A prefetch that completes after its caller timed out frees its chunks."""
+    async_loop, async_thread = init_asyncio_loop()
+    try:
+        connector = CreateConnector(resp_url, async_loop, local_backend, resp_config)
+        keys = [dumb_cache_engine_key(i) for i in range(3)]
+        _store_chunks(connector, local_backend, keys, async_loop, async_thread)
+
+        allocated = _abandon_prefetch(connector, keys, async_loop, async_thread)
+
+        assert len(allocated) == len(keys)
+        assert [memory_obj.get_ref_count() for memory_obj in allocated] == [0, 0, 0]
+    finally:
+        close_asyncio_loop(async_loop, async_thread)
+
+
+def test_resp_prefetch_abandoned_in_queue_allocates_nothing(
+    resp_url, local_backend, resp_config
+):
+    """A prefetch still queued when its caller timed out does not run at all."""
+    async_loop, async_thread = init_asyncio_loop()
+    try:
+        connector = CreateConnector(resp_url, async_loop, local_backend, resp_config)
+        keys = [dumb_cache_engine_key(i) for i in range(3)]
+        _store_chunks(connector, local_backend, keys, async_loop, async_thread)
+
+        # One worker, busy with another job until the caller has given up.
+        pq_executor = AsyncPQExecutor(async_loop, max_workers=1)
+        connector._connector.pq_executor = pq_executor
+        release_worker = asyncio.Event()
+        busy_job = None
+
+        async def occupy_worker():
+            nonlocal busy_job
+            busy_job = asyncio.ensure_future(
+                pq_executor.submit_job(release_worker.wait, priority=0)
+            )
+            await asyncio.sleep(0.01)
+            async_loop.call_later(0.1, release_worker.set)
+
+        allocated = _abandon_prefetch(
+            connector, keys, async_loop, async_thread, prepare=occupy_worker
+        )
+
+        assert busy_job is not None and busy_job.done()
+        assert allocated == []
     finally:
         close_asyncio_loop(async_loop, async_thread)
 

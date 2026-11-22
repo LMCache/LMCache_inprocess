@@ -223,10 +223,30 @@ class RESPConnector(RemoteConnector):
         lookup_id: str,
         keys: List[CacheEngineKey],
     ) -> List[MemoryObj]:
-        # prefetch priority
-        return await self.pq_executor.submit_job(
-            self._batched_get, keys=keys, priority=Priorities.PREFETCH
-        )
+        # The caller waits with a timeout. When it gives up, only its wait is
+        # cancelled: the job stays queued, runs later, and nobody is left to
+        # release the chunks it allocated in the local CPU backend.
+        abandoned = False
+
+        async def fetch(keys: List[CacheEngineKey]) -> List[Optional[MemoryObj]]:
+            if abandoned:
+                return []
+            memory_objs = await self._batched_get(keys)
+            if abandoned:
+                for memory_obj in memory_objs:
+                    if memory_obj is not None:
+                        memory_obj.ref_count_down()
+                return []
+            return memory_objs
+
+        try:
+            # prefetch priority
+            return await self.pq_executor.submit_job(
+                fetch, keys=keys, priority=Priorities.PREFETCH
+            )
+        except asyncio.CancelledError:
+            abandoned = True
+            raise
 
     # TODO
     @no_type_check
