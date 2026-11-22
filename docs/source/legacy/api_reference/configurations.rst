@@ -98,7 +98,7 @@ Basic cache settings that control the core functionality of LMCache.
      - List of storage backend names to search when retrieving or looking up KV caches. When specified, only the listed backends are searched. Valid values are the backend class names registered in the storage manager, including: ``"LocalCPUBackend"``, ``"LocalDiskBackend"``, ``"RemoteBackend"``, ``"PDBackend"``, ``"P2PBackend"``, ``"GdsBackend"``, etc, and any storage plugin backends. Default: null (search all active backends)
    * - extra_config
      - LMCACHE_EXTRA_CONFIG={"key": value, ...}
-     - Additional configuration as JSON dict. For NUMA manual mode, include "gpu_to_numa_mapping": {gpu_id: numa_node, ...}. Default: {}
+     - Additional configuration as JSON dict. For NUMA manual mode, include "gpu_to_numa_mapping": {gpu_id: numa_node, ...}. ``"store_skip_chunks_in_local_cpu": true`` makes a store skip the chunks the local CPU backend already holds instead of copying them from the GPU again; the other backends are then not given those chunks by that store. Default: {}
 
 Lazy Memory Allocator Configurations
 ------------------------------------
