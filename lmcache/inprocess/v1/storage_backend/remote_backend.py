@@ -525,6 +525,9 @@ class RemoteBackend(StorageBackendInterface):
         if self.connection is None:
             logger.warning("Connection is None in batched_async_contains, returning 0")
             return 0
+        if not keys:
+            # A prompt shorter than one chunk has no keys: nothing to ask.
+            return 0
         if self._mla_worker_id_as0_mode:
             keys = [key.with_new_worker_id(0) for key in keys]
 
