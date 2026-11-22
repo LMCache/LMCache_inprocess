@@ -355,6 +355,27 @@ Settings shared by disk-based storage backends (local disk and GDS). These confi
      - 4
      - Number of worker threads in the disk I/O thread pool. Applies to both the local disk backend and the GDS backend. Increase for higher parallelism on fast NVMe drives. (Replaces the deprecated ``gds_io_threads`` key.)
 
+Remote Backend Configurations
+-----------------------------
+
+Settings for the remote backend (``remote_url``). These configurations are specified through ``extra_config``.
+
+.. code-block:: yaml
+
+    extra_config:
+      remote_put_dedup_ttl_secs: 600
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Configuration Key
+     - Default
+     - Description
+   * - remote_put_dedup_ttl_secs
+     - 0
+     - Do not write a chunk to the remote store again while a write of the same chunk is in flight, or within this many seconds of a successful one. A lookup that finds the chunk missing in the remote store clears the record, so the chunk is written again. Set it below the remote store's own expiry. 0 disables it.
+
 Nixl (as a storage backend) Configurations
 ------------------------------------------
 

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections import OrderedDict
 from concurrent.futures import Future, TimeoutError
-from typing import Any, Callable, List, Optional, Sequence, Set
+from typing import Any, Callable, List, Optional, Sequence, Set, Tuple
 import asyncio
 import threading
 import time
@@ -27,6 +28,9 @@ from lmcache.v1.exceptions import IrrecoverableException
 from lmcache.v1.memory_management import MemoryObj
 
 logger = init_logger(__name__)
+
+# Bound on the number of remembered writes (remote_put_dedup_ttl_secs).
+_MAX_RECENT_PUTS = 200_000
 
 
 class RemoteBackend(StorageBackendInterface):
@@ -105,6 +109,14 @@ class RemoteBackend(StorageBackendInterface):
         self._get_blocking_failed_count = 0
         self._put_failed_count = 0
 
+        # Opt-in: do not write a chunk again while a write of it is in flight
+        # or within this many seconds of a successful one. 0 disables it.
+        self._put_dedup_ttl = float(
+            config.get_extra_config_value("remote_put_dedup_ttl_secs", 0)
+        )
+        # key -> time.monotonic() of its last successful write, oldest first
+        self._recent_puts: OrderedDict[CacheEngineKey, float] = OrderedDict()
+
         self._setup_metrics()
 
     def _setup_metrics(self) -> None:
@@ -178,13 +190,15 @@ class RemoteBackend(StorageBackendInterface):
             if self.config.extra_config is not None and self.config.extra_config.get(
                 "use_exists_sync", False
             ):
-                return self.connection.exists_sync(key)
+                res = self.connection.exists_sync(key)
             else:
                 future = asyncio.run_coroutine_threadsafe(
                     self.connection.exists(key), self.loop
                 )
                 res = future.result()
-                return res
+            if not res:
+                self._forget_put(key)
+            return res
         except Exception as e:
             logger.warning("Remote connection failed in contains: %s", e)
             logger.warning("Returning False")
@@ -206,7 +220,10 @@ class RemoteBackend(StorageBackendInterface):
             keys = [key.with_new_worker_id(0) for key in keys]
 
         try:
-            return self.connection.batched_contains(keys)
+            num_hit = self.connection.batched_contains(keys)
+            if num_hit < len(keys):
+                self._forget_put(keys[num_hit])
+            return num_hit
         except Exception as e:
             logger.warning("Remote connection failed in batched_contains: %s", e)
             return 0
@@ -215,11 +232,56 @@ class RemoteBackend(StorageBackendInterface):
         with self.lock:
             return key in self.put_tasks
 
+    def _written_recently(self, key: CacheEngineKey, now: float) -> bool:
+        """Whether `key` was written within the dedup TTL. Call with the lock."""
+        written_at = self._recent_puts.get(key)
+        return written_at is not None and now - written_at <= self._put_dedup_ttl
+
+    def _forget_put(self, key: CacheEngineKey) -> None:
+        """The remote store does not have `key` (evicted or expired there):
+        allow writing it again."""
+        if self._put_dedup_ttl > 0:
+            with self.lock:
+                self._recent_puts.pop(key, None)
+
+    def _record_puts(self, keys: Sequence[CacheEngineKey]) -> None:
+        if self._put_dedup_ttl <= 0:
+            return
+        now = time.monotonic()
+        with self.lock:
+            for key in keys:
+                self._recent_puts[key] = now
+                self._recent_puts.move_to_end(key)
+            while len(self._recent_puts) > _MAX_RECENT_PUTS:
+                self._recent_puts.popitem(last=False)
+
+    def _reserve_puts(
+        self,
+        keys: Sequence[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+    ) -> Tuple[List[CacheEngineKey], List[MemoryObj]]:
+        """
+        Drop the chunks that are being written or were written within the
+        dedup TTL, and mark the others as being written.
+        """
+        now = time.monotonic()
+        kept_keys: List[CacheEngineKey] = []
+        kept_objs: List[MemoryObj] = []
+        with self.lock:
+            for key, memory_obj in zip(keys, memory_objs, strict=False):
+                if key in self.put_tasks or self._written_recently(key, now):
+                    continue
+                self.put_tasks.add(key)
+                kept_keys.append(key)
+                kept_objs.append(memory_obj)
+        return kept_keys, kept_objs
+
     def put_callback(self, future: Future, key: CacheEngineKey):
         with self.lock:
             self.put_tasks.discard(key)
         try:
             future.result()
+            self._record_puts([key])
         except Exception as e:
             self._put_failed_count += 1
             logger.error("Put task failed for key %s: %s", key, e)
@@ -252,6 +314,11 @@ class RemoteBackend(StorageBackendInterface):
 
         if self.exists_in_put_tasks(key):
             return create_immediate_empty_future()
+
+        if self._put_dedup_ttl > 0:
+            with self.lock:
+                if self._written_recently(key, time.monotonic()):
+                    return create_immediate_empty_future()
 
         memory_obj.ref_count_up()
 
@@ -306,6 +373,11 @@ class RemoteBackend(StorageBackendInterface):
             if self._mla_worker_id_as0_mode:
                 return
 
+            if self._put_dedup_ttl > 0:
+                keys, memory_objs = self._reserve_puts(keys, memory_objs)
+                if not keys:
+                    return
+
             # First, increment reference counts for all objects
             for memory_obj in memory_objs:
                 memory_obj.ref_count_up()
@@ -314,6 +386,11 @@ class RemoteBackend(StorageBackendInterface):
             try:
                 for memory_obj in memory_objs:
                     compressed_memory_objs.append(self.serializer.serialize(memory_obj))
+            except Exception:
+                # No write was submitted: these keys are not being written.
+                with self.lock:
+                    self.put_tasks.difference_update(keys)
+                raise
             finally:
                 # Always decrement reference counts for all objects,
                 # regardless of whether serialization succeeded or failed
@@ -322,6 +399,8 @@ class RemoteBackend(StorageBackendInterface):
 
             def batched_done_callback(f: Future) -> None:
                 self.batched_put_callback(f, list(keys))
+                if not f.cancelled() and f.exception() is None:
+                    self._record_puts(keys)
                 # Invoke per-key callback for each key in the batch
                 if on_complete_callback is not None:
                     for key in keys:
@@ -534,10 +613,13 @@ class RemoteBackend(StorageBackendInterface):
             )
             # warning, this timeout will not actually stop the
             # scheduler from waiting for the result
-            return await asyncio.wait_for(
+            num_hit = await asyncio.wait_for(
                 self.connection.batched_async_contains(lookup_id, keys, pin),
                 self.config.blocking_timeout_secs,
             )
+            if num_hit < len(keys):
+                self._forget_put(keys[num_hit])
+            return num_hit
         except asyncio.TimeoutError:
             logger.warning("batched_async_contains timed out")
             return 0
