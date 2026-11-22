@@ -76,6 +76,7 @@ def _install_nixl_mock_if_absent() -> list[str]:
 _NIXL_MOCK_KEYS = _install_nixl_mock_if_absent()
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey  # noqa: E402
 from lmcache.inprocess.v1.storage_backend.nixl_storage_backend import (  # noqa: E402
     NixlDesc,
     NixlDynamicStorageAgent,
@@ -83,7 +84,6 @@ from lmcache.inprocess.v1.storage_backend.nixl_storage_backend import (  # noqa:
     NixlKeyMetadata,
     NixlStaticStorageBackend,
 )
-from lmcache.utils import CacheEngineKey  # noqa: E402
 from lmcache.v1.memory_management import (  # noqa: E402
     MemoryFormat,
     MemoryObj,

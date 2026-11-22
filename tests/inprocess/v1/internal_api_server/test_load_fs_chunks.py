@@ -15,13 +15,14 @@ import torch
 import yaml
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.cache_engine import LMCacheEngine
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.internal_api_server.api_server import app
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
 from lmcache.inprocess.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.inprocess.v1.storage_backend.remote_backend import RemoteBackend
-from lmcache.utils import CacheEngineKey, start_loop_in_thread_with_exceptions
+from lmcache.utils import start_loop_in_thread_with_exceptions
 from lmcache.v1.memory_allocators.ad_hoc_memory_allocator import AdHocMemoryAllocator
 from tests.inprocess.utils import create_test_memory_obj
 

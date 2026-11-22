@@ -18,6 +18,7 @@ import zmq.asyncio
 
 # First Party
 from lmcache import torch_dev
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.memory_allocators.paged_cpu_gpu_memory_allocator import (
     PagedCpuGpuMemoryAllocator,
@@ -34,7 +35,6 @@ from lmcache.logging import init_logger
 from lmcache.utils import (
     STR_DTYPE_TO_TORCH_DTYPE,
     TORCH_DTYPE_TO_STR_DTYPE,
-    CacheEngineKey,
 )
 from lmcache.v1.memory_management import (
     MemoryFormat,

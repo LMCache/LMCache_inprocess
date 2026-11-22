@@ -10,7 +10,15 @@ from lmcache.inprocess.v1.gpu_connector.mock_gpu_connector import MockGPUConnect
 from lmcache.inprocess.v1.gpu_connector.utils import need_gpu_interm_buffer
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
 from lmcache.utils import EngineType
-from lmcache.v1.gpu_connector.utils import LayoutHints
+
+try:
+    # First Party
+    from lmcache.v1.gpu_connector.utils import LayoutHints
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.v1.gpu_connector.utils"}:
+        raise
+    # First Party
+    from lmcache.v1.common.utils import LayoutHints
 
 # Boolean config flags whose underlying implementations exist only on a
 # subset of accelerators. Each entry is ``(attr_name, human_label,

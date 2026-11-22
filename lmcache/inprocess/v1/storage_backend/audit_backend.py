@@ -5,11 +5,11 @@ from typing import Any, Callable, List, Optional, Sequence
 import time
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.storage_backend.abstract_backend import (
     StorageBackendInterface,
 )
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryObj
 
 logger = init_logger(__name__)

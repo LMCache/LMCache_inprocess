@@ -19,6 +19,7 @@ import pytest
 
 # First Party
 from lmcache import torch_device_type
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.storage_backend.pd_backend import (
     CacheQueryRequest,
     CacheQueryResponse,
@@ -26,7 +27,6 @@ from lmcache.inprocess.v1.storage_backend.pd_backend import (
     PDConfig,
     PDMsg,
 )
-from lmcache.utils import CacheEngineKey
 
 
 class TestPDConfigBothRole:

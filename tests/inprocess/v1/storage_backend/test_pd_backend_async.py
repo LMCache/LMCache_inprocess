@@ -23,6 +23,7 @@ import pytest
 import torch
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.storage_backend.pd_backend import (
     AllocRequest as SyncAllocRequest,
 )
@@ -44,7 +45,6 @@ from lmcache.inprocess.v1.storage_backend.pd_backend_async import PDMsg as Async
 from lmcache.inprocess.v1.storage_backend.pd_backend_async import (
     ProxyNotif,
 )
-from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 
 TRANSFER_DELAY = 0.15

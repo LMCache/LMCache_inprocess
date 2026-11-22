@@ -11,10 +11,10 @@ import pytest
 import torch
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.storage_backend.abstract_backend import (
     AllocatorBackendInterface,
 )
-from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryFormat, TensorMemoryObj
 from tests.inprocess.utils import (
     check_method_signatures,

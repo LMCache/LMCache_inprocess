@@ -10,6 +10,7 @@ import pytest
 import torch
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.cache_controller.controllers.full_sync_tracker import (
     FullSyncTracker,
 )
@@ -27,7 +28,6 @@ from lmcache.inprocess.v1.cache_controller.message import (
 )
 from lmcache.inprocess.v1.cache_controller.utils import RegistryTree, WorkerInfo
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
-from lmcache.utils import CacheEngineKey
 
 # Constants
 LOCATION = "LocalCPUBackend"

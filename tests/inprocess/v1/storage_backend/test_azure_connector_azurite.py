@@ -26,13 +26,13 @@ import pytest
 import torch
 
 # First Party
+from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
 from lmcache.inprocess.v1.storage_backend.connector.azure_connector import (
     AzureConnector,
 )
 from lmcache.inprocess.v1.storage_backend.local_cpu_backend import LocalCPUBackend
-from lmcache.utils import CacheEngineKey
 
 azure_blob = pytest.importorskip("azure.storage.blob")
 SyncBlobServiceClient = azure_blob.BlobServiceClient

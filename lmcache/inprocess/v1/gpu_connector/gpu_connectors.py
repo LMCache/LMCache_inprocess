@@ -12,23 +12,52 @@ from lmcache.inprocess.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate
-from lmcache.v1.gpu_connector.kv_format.contiguity import (
-    attempt_permute_to_contiguous_view,
-)
-from lmcache.v1.gpu_connector.utils import (
-    LayoutHints,
-    assert_is_vllm_flash_attn_or_flash_infer,
-    assert_is_vllm_mla_or_flash_attn_or_flash_infer,
-    get_block_size,
-    get_elements_per_layer,
-    get_group_data_ptrs,
-    get_head_size,
-    get_num_blocks,
-    get_tokens_per_layer,
-    normalize_and_discover_per_layer_formats,
-    normalize_kv_and_discover_format,
-    resolve_block_stride_and_log_layout,
-)
+
+try:
+    # First Party
+    from lmcache.v1.gpu_connector.kv_format.contiguity import (
+        attempt_permute_to_contiguous_view,
+    )
+    from lmcache.v1.gpu_connector.utils import (
+        LayoutHints,
+        assert_is_vllm_flash_attn_or_flash_infer,
+        assert_is_vllm_mla_or_flash_attn_or_flash_infer,
+        get_block_size,
+        get_elements_per_layer,
+        get_group_data_ptrs,
+        get_head_size,
+        get_num_blocks,
+        get_tokens_per_layer,
+        normalize_and_discover_per_layer_formats,
+        normalize_kv_and_discover_format,
+        resolve_block_stride_and_log_layout,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name not in {
+        "lmcache.v1.gpu_connector.utils",
+        "lmcache.v1.gpu_connector.kv_format",
+        "lmcache.v1.gpu_connector.kv_format.contiguity",
+    }:
+        raise
+    from lmcache.v1.common.kv_format.contiguity import (
+        attempt_permute_to_contiguous_view,
+    )
+    from lmcache.v1.common.utils import (
+        LayoutHints,
+        assert_is_vllm_flash_attn_or_flash_infer,
+        assert_is_vllm_mla_or_flash_attn_or_flash_infer,
+        get_block_size,
+        get_elements_per_layer,
+        get_group_data_ptrs,
+        get_head_size,
+        get_num_blocks,
+        get_tokens_per_layer,
+        normalize_and_discover_per_layer_formats,
+        normalize_kv_and_discover_format,
+        resolve_block_stride_and_log_layout,
+    )
+
+# First Party
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.memory_allocators.gpu_memory_allocator import GPUMemoryAllocator
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
