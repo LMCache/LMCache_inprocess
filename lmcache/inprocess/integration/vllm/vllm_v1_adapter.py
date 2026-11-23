@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from array import array
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
@@ -98,6 +99,18 @@ class DisaggSpec:
 tmp_disagg_tracker: dict[str, DisaggSpec] = {}
 
 
+def token_ids_buffer(token_ids, stop: Optional[int] = None) -> array:
+    """``token_ids[:stop]`` as an int32 array.
+
+    One buffer to copy and to pickle, where a list is one Python int per
+    token. vLLM's own token buffer (an ``array`` subclass whose slices are
+    lists) is copied without going through Python ints.
+    """
+    if isinstance(token_ids, array) and token_ids.typecode == "i":
+        return array.__getitem__(token_ids, slice(0, stop))
+    return array("i", token_ids if stop is None else token_ids[:stop])
+
+
 def extract_request_configs(sampling_params: SamplingParams) -> Optional[dict]:
     return extract_request_configs_from_sampling_params(sampling_params)
 
@@ -110,8 +123,9 @@ class RequestTracker:
     # Total prompt token length
     prompt_len: int
 
-    # The token ids that has been scheduled so far
-    token_ids: list[int]
+    # The token ids that has been scheduled so far: a list, or an int32
+    # array with the ``request_token_ids_as_buffer`` option
+    token_ids: Union[list[int], array]
 
     # The block ids that has been allocated so far
     # NOTE: allocated blocks could be more than the number of tokens
@@ -190,7 +204,13 @@ class RequestTracker:
         return RequestTracker(
             req_id=new_request.req_id,
             prompt_len=len(new_request.prompt_token_ids),
-            token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
+            token_ids=(
+                token_ids_buffer(new_request.prompt_token_ids, num_tokens_to_compute)
+                if lmcache_config.get_extra_config_value(
+                    "request_token_ids_as_buffer", False
+                )
+                else new_request.prompt_token_ids[:num_tokens_to_compute].copy()
+            ),
             allocated_block_ids=unfolded_block_ids,
             num_saved_tokens=lmcache_cached_tokens,
             disagg_spec=disagg_spec,
@@ -257,7 +277,11 @@ class RequestTracker:
                 num_computed_tokens + len(new_token_ids),
                 lmcache_cached_tokens,
             )
-            self.token_ids = all_token_ids[:num_tokens_needed]
+            self.token_ids = (
+                token_ids_buffer(all_token_ids, num_tokens_needed)
+                if isinstance(self.token_ids, array)
+                else all_token_ids[:num_tokens_needed]
+            )
         else:
             self.allocated_block_ids.extend(new_block_ids)
             self.token_ids.extend(new_token_ids)
@@ -273,8 +297,9 @@ class RequestTracker:
 class ReqMeta:
     # Request id
     req_id: str
-    # Request tokens
-    token_ids: list[int]  # torch.Tensor
+    # Request tokens: a list, or an int32 array with the
+    # ``request_token_ids_as_buffer`` option
+    token_ids: Union[list[int], array]
     # Slot mapping
     slot_mapping: torch.Tensor
 
@@ -368,7 +393,9 @@ class ReqMeta:
         # If the request has multimodal hashes, apply them to the token ids
         if tracker.mm_hashes:
             # TODO: Optimize this
-            token_ids = torch.tensor(token_ids)
+            token_ids = torch.tensor(
+                token_ids.tolist() if isinstance(token_ids, array) else token_ids
+            )
             assert tracker.mm_positions is not None, (
                 "tracker got mm_hashes but no mm_positions"
             )
@@ -1049,7 +1076,7 @@ class LMCacheConnectorV1Impl:
             layerwise_storer = self._layerwise_save_storers.get(request.req_id)
             if layerwise_storer is None:
                 token_ids = request.token_ids
-                assert isinstance(token_ids, list)
+                assert isinstance(token_ids, (list, array))
 
                 slot_mapping = request.slot_mapping
                 assert isinstance(slot_mapping, torch.Tensor)
@@ -1824,7 +1851,11 @@ class LMCacheConnectorV1Impl:
                     )
                     tokens_to_keep = num_token_slots
 
-                request_tracker.token_ids = list(request.all_token_ids[:tokens_to_keep])
+                request_tracker.token_ids = (
+                    token_ids_buffer(request.all_token_ids, tokens_to_keep)
+                    if isinstance(request_tracker.token_ids, array)
+                    else list(request.all_token_ids[:tokens_to_keep])
+                )
                 request_tracker.num_saved_tokens = min(
                     request_tracker.num_saved_tokens, tokens_to_keep
                 )
