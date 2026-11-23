@@ -567,6 +567,12 @@ class LMCacheConnectorV1Impl:
             "skip_last_n_tokens", 0
         )
 
+        # Opt-in: do not look up a request whose prompt vLLM's own prefix cache
+        # already holds except for at most this many tokens. 0 disables it.
+        self._skip_lookup_local_tail_tokens = int(
+            config.get_extra_config_value("skip_lookup_local_tail_tokens", 0)
+        )
+
         self.num_layers = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
         )
@@ -1398,6 +1404,26 @@ class LMCacheConnectorV1Impl:
         # report no external hits and let vLLM recompute instead of asserting and
         # crashing EngineCore during scheduling.
         if self.lookup_client is None:
+            return 0
+
+        if (
+            num_computed_tokens > 0
+            and request.num_tokens - num_computed_tokens
+            <= self._skip_lookup_local_tail_tokens
+        ):
+            # vLLM's prefix cache holds all of the prompt but a short tail, so
+            # a lookup could add at most that tail, while the scheduler would
+            # wait for its answer. Report no external tokens. The save path
+            # skips the chunks before the tail, which the count recorded here
+            # tells it: that count must sit on a chunk boundary.
+            self._requests_priority.setdefault(req_id, getattr(request, "priority", 0))
+            self.load_specs[req_id] = LoadSpec(
+                vllm_cached_tokens=num_computed_tokens,
+                lmcache_cached_tokens=num_computed_tokens
+                // self._lmcache_chunk_size
+                * self._lmcache_chunk_size,
+                can_load=False,
+            )
             return 0
 
         if (
