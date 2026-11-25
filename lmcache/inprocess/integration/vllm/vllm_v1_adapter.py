@@ -29,7 +29,16 @@ import torch
 # Use LMCache's own math utilities instead of vllm's
 # (avoids dependency on vllm internal changes like https://github.com/vllm-project/vllm/pull/27188)
 from lmcache import utils
-from lmcache.banner import print_banner_once
+
+try:
+    # First Party
+    from lmcache.banner import print_banner_once
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.banner"}:
+        raise
+    from lmcache.v1.common.banner import print_banner_once
+
+# First Party
 from lmcache.inprocess.integration.vllm.utils import (
     ENGINE_NAME,
     apply_mm_hashes_to_token_ids,
@@ -46,8 +55,27 @@ from lmcache.inprocess.v1.compute.blend import LMCBlenderBuilder
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.config_base import validate_and_set_config_value
 from lmcache.inprocess.v1.manager import LMCacheManager
-from lmcache.logging import init_logger
-from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
+from lmcache.utils import cdiv
+
+try:
+    # First Party
+    from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate
+except ImportError as exc:
+    if exc.name not in {"lmcache.utils"}:
+        raise
+    # First Party
+    from lmcache.integration.vllm.utils import CacheStoreEvent
+    from lmcache.v1.common.decorators import _lmcache_nvtx_annotate
 
 if TYPE_CHECKING:
     # Third Party

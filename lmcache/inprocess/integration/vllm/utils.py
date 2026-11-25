@@ -21,7 +21,15 @@ from lmcache.integration.vllm.utils import (
     mla_enabled,
     vllm_layout_hints,
 )
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    # First Party
+    from lmcache.v1.common.logging import init_logger
 
 if TYPE_CHECKING:
     # Third Party

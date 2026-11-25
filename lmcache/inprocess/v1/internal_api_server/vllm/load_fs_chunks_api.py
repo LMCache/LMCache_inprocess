@@ -14,7 +14,15 @@ from starlette.responses import PlainTextResponse
 from lmcache.inprocess.utils import CacheEngineKey
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.storage_backend.remote_backend import RemoteBackend
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    # First Party
+    from lmcache.v1.common.logging import init_logger
 
 
 class LoadFSChunksRequest(BaseModel):

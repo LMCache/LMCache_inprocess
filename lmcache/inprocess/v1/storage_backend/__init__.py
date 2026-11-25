@@ -19,7 +19,15 @@ from lmcache.inprocess.v1.storage_backend.p2p_backend import P2PBackend
 from lmcache.inprocess.v1.storage_backend.remote_backend import (  # noqa: F401
     RemoteBackend,
 )
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    # First Party
+    from lmcache.v1.common.logging import init_logger
 
 if TYPE_CHECKING:
     # First Party

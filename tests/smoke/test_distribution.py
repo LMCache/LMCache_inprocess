@@ -13,7 +13,15 @@ from lmcache.inprocess.v1.gpu_connector import CreateGPUConnector
 from lmcache.inprocess.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.inprocess.v1.gpu_connector.mock_gpu_connector import MockGPUConnector
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
-from lmcache.utils import EngineType
+
+try:
+    # First Party
+    from lmcache.utils import EngineType
+except ImportError as exc:
+    if exc.name not in {"lmcache.utils"}:
+        raise
+    # First Party
+    from lmcache.v1.common.custom_types import EngineType
 
 
 def test_distribution_metadata() -> None:

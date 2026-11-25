@@ -8,8 +8,24 @@ from lmcache.inprocess.v1.lookup_client.record_strategies.base import (
     AsyncRecorder,
     RecordStrategy,
 )
-from lmcache.logging import init_logger
-from lmcache.v1.utils.subclass_discovery import discover_subclasses
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    # First Party
+    from lmcache.v1.common.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.v1.utils.subclass_discovery import discover_subclasses
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.v1.utils.subclass_discovery"}:
+        raise
+    # First Party
+    from lmcache.v1.common.subclass_discovery import discover_subclasses
 
 logger = init_logger(__name__)
 

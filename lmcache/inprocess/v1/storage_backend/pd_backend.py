@@ -27,7 +27,16 @@ from lmcache.inprocess.v1.storage_backend.abstract_backend import (
 from lmcache.inprocess.v1.transfer_channel import CreateTransferChannel
 from lmcache.inprocess.v1.transfer_channel.transfer_utils import get_correct_device
 from lmcache.integration.vllm.utils import get_size_bytes
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.utils import (
     STR_DTYPE_TO_TORCH_DTYPE,
     TORCH_DTYPE_TO_STR_DTYPE,

@@ -18,7 +18,16 @@ import time
 from lmcache.inprocess.v1.storage_backend.connector.base_connector import (
     RemoteConnector,
 )
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.v1.distributed.l2_adapters.hfbucket_client import (
     HFBucketClient,
     HFBucketClientInterface,

@@ -48,13 +48,28 @@ from lmcache.inprocess.v1.token_database import (
     SegmentTokenDatabase,
     TokenDatabase,
 )
-from lmcache.logging import init_logger
-from lmcache.utils import (
-    CacheStoreEvent,
-    _lmcache_nvtx_annotate,
-    compress_slot_mapping,
-    convert_tokens_to_list,
-)
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
+from lmcache.utils import compress_slot_mapping, convert_tokens_to_list
+
+try:
+    # First Party
+    from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate
+except ImportError as exc:
+    if exc.name not in {"lmcache.utils"}:
+        raise
+    from lmcache.integration.vllm.utils import CacheStoreEvent
+    from lmcache.v1.common.decorators import _lmcache_nvtx_annotate
+
+# First Party
 from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
 from lmcache.v1.memory_allocators.paged_tensor_memory_allocator import (
     PagedTensorMemoryAllocator,

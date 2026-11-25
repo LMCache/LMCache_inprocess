@@ -5,8 +5,14 @@ from typing import Dict
 # Third Party
 from torch import nn
 
-# First Party
-from lmcache.logging import init_logger
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    # First Party
+    from lmcache.v1.common.logging import init_logger
 
 logger = init_logger(__name__)
 

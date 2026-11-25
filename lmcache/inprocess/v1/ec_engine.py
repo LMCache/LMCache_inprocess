@@ -26,7 +26,16 @@ from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.event_manager import EventManager
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
 from lmcache.inprocess.v1.storage_backend.storage_manager import StorageManager
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.v1.memory_management import MemoryFormat
 
 logger = init_logger(__name__)

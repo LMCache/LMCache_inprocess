@@ -16,7 +16,15 @@ from lmcache.inprocess.v1.health_monitor.base import HealthCheck, HealthMonitor
 from lmcache.inprocess.v1.health_monitor.checks.remote_backend_check import (
     RemoteBackendHealthCheck,
 )
-from lmcache.v1.exceptions import IrrecoverableException
+
+try:
+    # First Party
+    from lmcache.v1.exceptions import IrrecoverableException
+except ImportError as exc:
+    if exc.name not in {"lmcache.v1.exceptions"}:
+        raise
+    # First Party
+    from lmcache.v1.common.errors import IrrecoverableException
 
 # ============================================================================
 # Mock Classes

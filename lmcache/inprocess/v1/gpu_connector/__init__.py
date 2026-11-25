@@ -9,7 +9,15 @@ from lmcache.inprocess.v1.gpu_connector.gpu_connectors import GPUConnectorInterf
 from lmcache.inprocess.v1.gpu_connector.mock_gpu_connector import MockGPUConnector
 from lmcache.inprocess.v1.gpu_connector.utils import need_gpu_interm_buffer
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
-from lmcache.utils import EngineType
+
+try:
+    # First Party
+    from lmcache.utils import EngineType
+except ImportError as exc:
+    if exc.name not in {"lmcache.utils"}:
+        raise
+    # First Party
+    from lmcache.v1.common.custom_types import EngineType
 
 try:
     # First Party

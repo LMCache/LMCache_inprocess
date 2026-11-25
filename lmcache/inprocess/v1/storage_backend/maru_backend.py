@@ -21,7 +21,16 @@ from lmcache.inprocess.v1.storage_backend.abstract_backend import (
     AllocatorBackendInterface,
 )
 from lmcache.integration.vllm.utils import get_size_bytes
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    from lmcache.v1.common.logging import init_logger
+
+# First Party
 from lmcache.v1.memory_management import (
     MemoryAllocatorInterface,
     MemoryFormat,

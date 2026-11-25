@@ -20,7 +20,15 @@ from lmcache.inprocess.v1.cache_controller.config import (
     load_controller_config_with_overrides,
     override_controller_config_from_dict,
 )
-from lmcache.logging import init_logger
+
+try:
+    # First Party
+    from lmcache.logging import init_logger
+except ModuleNotFoundError as exc:
+    if exc.name not in {"lmcache.logging"}:
+        raise
+    # First Party
+    from lmcache.v1.common.logging import init_logger
 
 logger = init_logger(__name__)
 
