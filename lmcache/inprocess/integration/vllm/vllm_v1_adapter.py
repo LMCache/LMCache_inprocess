@@ -269,14 +269,29 @@ class RequestTracker:
             self.is_decode_phase = True
 
 
+def build_slot_mapping(
+    block_ids: list[int], block_size: int, num_tokens: int
+) -> torch.Tensor:
+    """The KV cache slot of each of the first ``num_tokens`` tokens of a
+    request that owns ``block_ids``."""
+    block_ids_tensor = torch.tensor(block_ids, dtype=torch.long)
+    block_offsets = torch.arange(0, block_size, dtype=torch.long)
+    slot_mapping = (
+        block_offsets.reshape((1, block_size))
+        + block_ids_tensor.reshape((len(block_ids), 1)) * block_size
+    )
+    return slot_mapping.flatten()[:num_tokens]
+
+
 @dataclass
 class ReqMeta:
     # Request id
     req_id: str
     # Request tokens
     token_ids: list[int]  # torch.Tensor
-    # Slot mapping
-    slot_mapping: torch.Tensor
+    # Slot mapping. None with the ``slot_mapping_from_block_ids`` option: the
+    # worker then builds it from ``block_ids`` (see ``request_slot_mapping``)
+    slot_mapping: Optional[torch.Tensor]
 
     # Whether is last prefill or not
     is_last_prefill: bool = False
@@ -289,6 +304,11 @@ class ReqMeta:
     disagg_spec: Optional[DisaggSpec] = None
     # the configs of the request
     request_configs: Optional[dict] = None
+    # With the ``slot_mapping_from_block_ids`` option: the vLLM blocks that
+    # hold the request's tokens and vLLM's block size, sent instead of the
+    # slot mapping
+    block_ids: Optional[list[int]] = None
+    block_size: int = 0
 
     @staticmethod
     def from_request_tracker(
@@ -298,6 +318,7 @@ class ReqMeta:
         load_spec: Optional[LoadSpec] = None,
         discard_partial_chunks: bool = True,
         save_decode_cache: bool = False,
+        slot_mapping_from_block_ids: bool = False,
     ) -> Optional["ReqMeta"]:
         """Create the request metadata from a request tracker.
 
@@ -308,6 +329,8 @@ class ReqMeta:
             load_spec (Optional[LoadSpec]): the load spec for KV cache loading.
             discard_partial_chunks (bool): whether to discard partial chunks.
             save_decode_cache (bool): whether to save the cache in decode phase.
+            slot_mapping_from_block_ids (bool): send the block ids instead of
+                the slot mapping (one int64 per token); the worker rebuilds it.
 
         Returns:
             the request metadata if we need to perform load/save
@@ -393,15 +416,17 @@ class ReqMeta:
                 block_size,
             )
 
-        block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
-        block_offsets = torch.arange(0, block_size, dtype=torch.long)
-        slot_mapping = (
-            block_offsets.reshape((1, block_size))
-            + block_ids.reshape((num_blocks, 1)) * block_size
-        )
-
-        slot_mapping = slot_mapping.flatten()[: len(token_ids)]
-        assert slot_mapping.dtype == torch.long  # TODO: this could be removed
+        slot_mapping: Optional[torch.Tensor]
+        block_ids: Optional[list[int]] = None
+        if slot_mapping_from_block_ids and len(token_ids) <= num_blocks * block_size:
+            # Only the blocks that hold these tokens; the worker computes the
+            # same mapping from them.
+            slot_mapping = None
+            block_ids = tracker.allocated_block_ids[: cdiv(len(token_ids), block_size)]
+        else:
+            slot_mapping = build_slot_mapping(
+                tracker.allocated_block_ids, block_size, len(token_ids)
+            )
 
         # For load operation: log if the request is scheduled to load
         if load_spec is not None and load_spec.can_load:
@@ -428,7 +453,22 @@ class ReqMeta:
             load_spec=load_spec,
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
+            block_ids=block_ids,
+            block_size=block_size if block_ids is not None else 0,
         )
+
+
+def request_slot_mapping(request: ReqMeta) -> torch.Tensor:
+    """The slot mapping of a request on the worker side: the one that was
+    sent, or built (once) from the block ids that were sent instead."""
+    if request.slot_mapping is None:
+        assert request.block_ids is not None, (
+            f"Request {request.req_id} has neither a slot mapping nor block ids"
+        )
+        request.slot_mapping = build_slot_mapping(
+            request.block_ids, request.block_size, len(request.token_ids)
+        )
+    return request.slot_mapping
 
 
 @dataclass
@@ -565,6 +605,12 @@ class LMCacheConnectorV1Impl:
 
         self.skip_last_n_tokens = vllm_config.kv_transfer_config.get_from_extra_config(
             "skip_last_n_tokens", 0
+        )
+
+        # Opt-in: the scheduler sends each request's block ids and the worker
+        # builds the slot mapping, instead of sending one int64 per token.
+        self._slot_mapping_from_block_ids = bool(
+            config.get_extra_config_value("slot_mapping_from_block_ids", False)
         )
 
         self.num_layers = vllm_config.model_config.get_num_layers(
@@ -813,7 +859,7 @@ class LMCacheConnectorV1Impl:
 
             tokens = request.token_ids
             # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = request.slot_mapping.to(self.device)
+            slot_mapping = request_slot_mapping(request).to(self.device)
             assert len(tokens) == len(slot_mapping)
 
             token_mask = torch.ones(len(tokens), dtype=torch.bool)
@@ -1051,7 +1097,7 @@ class LMCacheConnectorV1Impl:
                 token_ids = request.token_ids
                 assert isinstance(token_ids, list)
 
-                slot_mapping = request.slot_mapping
+                slot_mapping = request_slot_mapping(request)
                 assert isinstance(slot_mapping, torch.Tensor)
                 assert len(slot_mapping) == len(token_ids)
 
@@ -1156,7 +1202,7 @@ class LMCacheConnectorV1Impl:
 
             token_ids = request.token_ids
 
-            slot_mapping = request.slot_mapping
+            slot_mapping = request_slot_mapping(request)
             assert isinstance(slot_mapping, torch.Tensor)
             if len(slot_mapping) != len(token_ids):
                 logger.warning(
@@ -1680,6 +1726,7 @@ class LMCacheConnectorV1Impl:
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
+                slot_mapping_from_block_ids=self._slot_mapping_from_block_ids,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
@@ -1726,6 +1773,7 @@ class LMCacheConnectorV1Impl:
                     load_spec=load_spec,
                     discard_partial_chunks=self._discard_partial_chunks,
                     save_decode_cache=self.config.save_decode_cache,
+                    slot_mapping_from_block_ids=self._slot_mapping_from_block_ids,
                 )
                 if req_meta is not None:
                     meta.add_request(req_meta)
@@ -1849,6 +1897,7 @@ class LMCacheConnectorV1Impl:
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
+                slot_mapping_from_block_ids=self._slot_mapping_from_block_ids,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
