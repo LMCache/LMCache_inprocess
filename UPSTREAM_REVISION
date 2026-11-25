@@ -2,3 +2,4 @@ repository=https://github.com/LMCache/LMCache
 revision=cf87a1ca70fcea192dc3820c745aae0b9253061b
 ref=dev
 copied_at=2026-11-06
+tensorrt_exports_revision=463d798a1d185f8f40a188975ecfb674c7535803
