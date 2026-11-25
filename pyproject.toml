@@ -55,6 +55,7 @@ include = [
     "lmcache.inprocess",
     "lmcache.inprocess.*",
     "lmcache.integration.vllm",
+    "lmcache.integration.tensorrt_llm",
 ]
 namespaces = true
 

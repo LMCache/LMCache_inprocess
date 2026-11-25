@@ -16,6 +16,7 @@ def main() -> None:
     package_files = {name for name in names if name.startswith("lmcache/")}
     compatibility_files = {
         "lmcache/integration/vllm/vllm_v1_adapter.py",
+        "lmcache/integration/tensorrt_llm/tensorrt_adapter.py",
     }
     unexpected = sorted(
         name
@@ -30,6 +31,7 @@ def main() -> None:
         "lmcache/inprocess/v1/cache_engine.py",
         "lmcache/inprocess/v1/cache_controller/frontend/static/index.html",
         "lmcache/integration/vllm/vllm_v1_adapter.py",
+        "lmcache/integration/tensorrt_llm/tensorrt_adapter.py",
     }
     missing = sorted(required - names)
     if missing:

@@ -40,14 +40,22 @@ operations; CPU validation uses `NO_GPU_EXT=1`.
 
 - Distribution name: `lmcache_inprocess`
 - Import namespace: `lmcache.inprocess`
+- Compatibility imports: `lmcache.integration.vllm.vllm_v1_adapter` and
+  `lmcache.integration.tensorrt_llm.tensorrt_adapter`
 - Base dependency: `lmcache>=0.5.7rc3`
 - Python: 3.10 through 3.14
 - Supported source of shared native extensions: the installed `lmcache` package
 
 Because both distributions contribute files below the top-level `lmcache`
 directory, install and uninstall them with the same environment manager. A
-future LMCache release should stop shipping `lmcache/inprocess` before both
-packages are published as stable releases, avoiding overlapping wheel ownership.
+compatible LMCache release must stop shipping each extracted path, including
+the compatibility imports above, to avoid overlapping wheel ownership.
+
+TensorRT-LLM's `lmcache` connector preset imports the compatibility path above,
+which forwards to `lmcache.inprocess.integration.tensorrt_llm.tensorrt_adapter`.
+Install this distribution for that preset. The `lmcache-mp` adapter remains
+owned by LMCache. When upgrading across the extraction, upgrade LMCache first
+and then install or reinstall this distribution so the shim remains installed.
 
 ## Development and validation
 
@@ -68,6 +76,7 @@ and tests compatibility against a pinned LMCache revision and current LMCache
 ## Repository layout
 
 - `lmcache/inprocess/`: package source
+- `lmcache/integration/`: compatibility shims for inference-engine import paths
 - `tests/inprocess/`: copied unit and integration tests
 - `examples/inprocess/`: in-process examples
 - `benchmarks/inprocess/`: in-process benchmarks
