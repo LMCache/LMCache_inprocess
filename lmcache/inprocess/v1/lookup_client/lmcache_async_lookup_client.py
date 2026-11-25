@@ -28,6 +28,11 @@ from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
 
+# With lookup_backoff_once_per_pass, a backoff is skipped when the previous one
+# ended less than this many seconds ago: the call belongs to the same
+# scheduling pass, which has already waited.
+_SAME_PASS_WINDOW_SECS = 0.002
+
 
 # NOTE(Jiayi): Prefetch could load extra redundant cache if multiple
 # workers has different hit tokens.
@@ -36,6 +41,13 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
     ZMQ-based lookup client that communicates with a lookup server.
 
     Related extra_config:
+    - lookup_backoff_time:
+        seconds the scheduler waits each time it polls a lookup that is
+        still in progress, default 0.01.
+    - lookup_backoff_once_per_pass:
+        the scheduler polls every waiting request in each scheduling pass,
+        and by default waits lookup_backoff_time for each of them. If true,
+        it waits once per pass, default False.
     - lookup_server_worker_ids:
         is a config to control create lookup server on some workers.
         if mla is not enabled, default is [];
@@ -155,6 +167,21 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
             self.lookup_backoff_time = float(
                 config.extra_config.get("lookup_backoff_time", self.lookup_backoff_time)
             )
+        self.backoff_once_per_pass = bool(
+            config.get_extra_config_value("lookup_backoff_once_per_pass", False)
+        )
+        # time.monotonic() at the end of the last backoff
+        self._last_backoff_end = 0.0
+
+    def _backoff(self) -> None:
+        """Wait before the scheduler polls again, at most once per pass."""
+        if (
+            self.backoff_once_per_pass
+            and time.monotonic() - self._last_backoff_end < _SAME_PASS_WINDOW_SECS
+        ):
+            return
+        time.sleep(self.lookup_backoff_time)
+        self._last_backoff_end = time.monotonic()
 
     def lookup_cache(self, lookup_id: str) -> Optional[int]:
         """
@@ -173,7 +200,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                 first_lookup_time = self.first_lookup_time.get(lookup_id)
                 if first_lookup_time is None:
                     return 0
-                time.sleep(self.lookup_backoff_time)
+                self._backoff()
                 if (
                     time.time() - first_lookup_time
                 ) * 1000 > self.config.lookup_timeout_ms:
@@ -220,7 +247,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
 
         for i in range(self.world_size):
             self.push_sockets[i].send(msg_buf, copy=False)
-        time.sleep(self.lookup_backoff_time)
+        self._backoff()
         return None
 
     def process_responses_from_workers(self):
