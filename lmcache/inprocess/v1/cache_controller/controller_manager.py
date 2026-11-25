@@ -261,6 +261,12 @@ class LMCacheControllerManager:
         self.pull_socket_active_requests = 0
         self.reply_socket_active_requests = 0
 
+        # Socket backlog flags, refreshed by the receive loops. ZMQ sockets
+        # are not thread-safe, so the gauges below (read from the metrics
+        # scrape thread) must not query the sockets themselves.
+        self.pull_socket_has_pending = 0
+        self.reply_socket_has_pending = 0
+
         prometheus_logger = PrometheusLogger.GetInstanceOrNone()
         if prometheus_logger is not None:
             prometheus_logger.pull_socket_message_count.set_function(
@@ -272,11 +278,11 @@ class LMCacheControllerManager:
 
             # Socket queue/backlog metrics
             prometheus_logger.pull_socket_has_pending.set_function(
-                lambda: self._check_socket_has_pending(self.controller_pull_socket)
+                lambda: self.pull_socket_has_pending
             )
             if self.controller_urls["reply"] is not None:
                 prometheus_logger.reply_socket_has_pending.set_function(
-                    lambda: self._check_socket_has_pending(self.controller_reply_socket)
+                    lambda: self.reply_socket_has_pending
                 )
 
             # Active request metrics
@@ -328,6 +334,8 @@ class LMCacheControllerManager:
     def _check_socket_has_pending(self, socket) -> int:
         """Check if socket has pending messages.
 
+        Must only be called from the thread that owns ``socket``.
+
         Returns:
             1 if socket has pending messages, 0 otherwise
         """
@@ -343,6 +351,7 @@ class LMCacheControllerManager:
     async def handle_batched_push_request(self, socket) -> Optional[MsgBase]:
         while True:
             parts = await socket.recv_multipart()
+            self.pull_socket_has_pending = self._check_socket_has_pending(socket)
             part_count = len(parts)
             with SocketMetricsContext(self, SocketType.PULL, part_count):
                 for part in parts:
@@ -376,6 +385,7 @@ class LMCacheControllerManager:
         """
         while True:
             frames = await socket.recv_multipart()
+            self.reply_socket_has_pending = self._check_socket_has_pending(socket)
             with SocketMetricsContext(self, SocketType.REPLY):
                 identity = None
                 try:
