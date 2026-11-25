@@ -57,6 +57,10 @@ Install this distribution for that preset. The `lmcache-mp` adapter remains
 owned by LMCache. When upgrading across the extraction, upgrade LMCache first
 and then install or reinstall this distribution so the shim remains installed.
 
+Package-level InProcess TensorRT-LLM exports are available from
+`lmcache.inprocess.integration.tensorrt_llm`. The core
+`lmcache.integration.tensorrt_llm` package exports only the MP adapter.
+
 ## Development and validation
 
 ```bash
