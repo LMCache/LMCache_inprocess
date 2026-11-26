@@ -98,7 +98,7 @@ Basic cache settings that control the core functionality of LMCache.
      - List of storage backend names to search when retrieving or looking up KV caches. When specified, only the listed backends are searched. Valid values are the backend class names registered in the storage manager, including: ``"LocalCPUBackend"``, ``"LocalDiskBackend"``, ``"RemoteBackend"``, ``"PDBackend"``, ``"P2PBackend"``, ``"GdsBackend"``, etc, and any storage plugin backends. Default: null (search all active backends)
    * - extra_config
      - LMCACHE_EXTRA_CONFIG={"key": value, ...}
-     - Additional configuration as JSON dict. For NUMA manual mode, include "gpu_to_numa_mapping": {gpu_id: numa_node, ...}. Default: {}
+     - Additional configuration as JSON dict. For NUMA manual mode, include "gpu_to_numa_mapping": {gpu_id: numa_node, ...}. ``"request_token_ids_as_buffer": true`` makes the vLLM connector keep and send each request's token ids as one 32-bit integer buffer instead of a Python list (same cache keys; cheaper per request for long prompts). Default: {}
 
 Lazy Memory Allocator Configurations
 ------------------------------------

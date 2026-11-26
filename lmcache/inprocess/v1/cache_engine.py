@@ -542,10 +542,9 @@ class LMCacheEngine:
                         lora_name=None,
                     )
                     if tokens is not None:
-                        stored_event.token_ids = convert_tokens_to_list(
-                            tokens,
-                            start,
-                            end,
+                        # list(): the ids may be an int32 buffer
+                        stored_event.token_ids = list(
+                            convert_tokens_to_list(tokens, start, end)
                         )
                         if isinstance(tokens, torch.Tensor):
                             stored_event.medium = tokens.device
@@ -735,10 +734,9 @@ class LMCacheEngine:
                     lora_name=None,
                 )
                 if tokens is not None:
-                    stored_event.token_ids = convert_tokens_to_list(
-                        tokens,
-                        start,
-                        end,
+                    # list(): the ids may be an int32 buffer
+                    stored_event.token_ids = list(
+                        convert_tokens_to_list(tokens, start, end)
                     )
                     if isinstance(tokens, torch.Tensor):
                         stored_event.medium = tokens.device

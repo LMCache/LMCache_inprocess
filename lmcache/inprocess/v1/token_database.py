@@ -12,6 +12,8 @@ TODO(baoloongmao): Move this to vllm_v1_adapter to decouple from vLLM
 """
 
 # Standard
+from array import array
+from hashlib import blake2b
 from typing import Any, Iterable, List, Optional, Tuple, Union
 import abc
 import os
@@ -30,6 +32,10 @@ from lmcache.utils import _lmcache_nvtx_annotate
 logger = init_logger(__name__)
 
 NONE_HASH = 0
+
+# Entries of the memo of chunk hashes of int32 token buffers (see _hash_tokens);
+# it is emptied when full.
+_BUFFER_CHUNK_HASHES_MAX = 200_000
 
 
 def _normalize_hash_to_int(hash_value: Union[int, bytes]) -> int:
@@ -87,6 +93,9 @@ class TokenDatabase(metaclass=abc.ABCMeta):
 
         # Get hash function with vLLM version compatibility
         self.hash_func = self._get_vllm_hash_func(hash_algorithm)
+
+        # (previous hash, digest of the chunk's int32 bytes) -> chunk hash
+        self._buffer_chunk_hashes: dict[tuple[Optional[int], bytes], int] = {}
 
         # Initialize NONE_HASH (vLLM >= PR#20511)
         # NOTE: For centralized cache sharing, ensure PYTHONHASHSEED is
@@ -269,13 +278,25 @@ class TokenDatabase(metaclass=abc.ABCMeta):
 
     def _hash_tokens(
         self,
-        tokens: Union[torch.Tensor, List[int]],
+        tokens: Union[torch.Tensor, List[int], array],
         prefix_hash: Optional[int] = None,
         extra_keys: Optional[list[Any]] = None,
     ) -> int:
+        # Token ids that arrive as an int32 buffer hash to what the same ids
+        # hash to as a list. Requests that share a prefix share its chunks,
+        # and a buffer is cheap to recognise, so a chunk seen before (same
+        # previous hash, same ids) takes its hash from a memo instead of
+        # turning 'chunk_size' ids into Python ints again.
+        memo_key = None
+        if isinstance(tokens, array) and extra_keys is None:
+            memo_key = (prefix_hash, blake2b(tokens.tobytes(), digest_size=16).digest())
+            cached_hash = self._buffer_chunk_hashes.get(memo_key)
+            if cached_hash is not None:
+                return cached_hash
+
         if isinstance(tokens, torch.Tensor):
             tokens_tuple = tuple(tokens.cpu().tolist())
-        elif isinstance(tokens, list):
+        elif isinstance(tokens, (list, array)):
             tokens_tuple = tuple(tokens)
         else:
             raise ValueError(f"Unsupported tokens type: {type(tokens)}")
@@ -291,9 +312,14 @@ class TokenDatabase(metaclass=abc.ABCMeta):
             prefix_hash, tokens_tuple, extra_keys
         )
 
-        return _normalize_hash_to_int(
+        chunk_hash = _normalize_hash_to_int(
             self.hash_func((canon_prefix, canon_tokens, canon_extra))
         )
+        if memo_key is not None:
+            if len(self._buffer_chunk_hashes) >= _BUFFER_CHUNK_HASHES_MAX:
+                self._buffer_chunk_hashes.clear()
+            self._buffer_chunk_hashes[memo_key] = chunk_hash
+        return chunk_hash
 
 
 class ChunkedTokenDatabase(TokenDatabase):
