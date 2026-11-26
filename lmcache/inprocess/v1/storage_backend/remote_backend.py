@@ -105,6 +105,15 @@ class RemoteBackend(StorageBackendInterface):
         self._get_blocking_failed_count = 0
         self._put_failed_count = 0
 
+        # Opt-in: a chunk prefetched from the remote store is also kept in the
+        # local CPU backend, so the next lookup that needs it does not fetch
+        # it again.
+        self._prefetch_write_back = (
+            bool(config.get_extra_config_value("remote_prefetch_write_back", False))
+            and local_cpu_backend is not None
+            and local_cpu_backend.use_hot
+        )
+
         self._setup_metrics()
 
     def _setup_metrics(self) -> None:
@@ -570,6 +579,8 @@ class RemoteBackend(StorageBackendInterface):
                 "Connection is None in batched_get_non_blocking, returning empty list"
             )
             return []
+        if self._prefetch_write_back:
+            return await self._prefetch_with_write_back(lookup_id, keys)
         try:
             # warning, this timeout will not actually stop the
             # scheduler from waiting for the result
@@ -583,6 +594,64 @@ class RemoteBackend(StorageBackendInterface):
         except Exception as e:
             logger.warning("Error occurred in batched_get_non_blocking: %s", e)
             return []
+
+    async def _prefetch_with_write_back(
+        self,
+        lookup_id: str,
+        keys: List[CacheEngineKey],
+    ) -> List[MemoryObj]:
+        """
+        Prefetch `keys` and keep what was fetched in the local CPU backend.
+
+        The lookup found these chunks only in the remote store. Since then an
+        earlier prefetch may have put some of them into the local CPU backend:
+        those are taken from there, and only the rest is fetched. A chunk is
+        therefore fetched once, however many lookups need it.
+
+        :return: the chunks obtained, as a prefix of `keys`, each holding a
+            reference for the caller.
+        """
+        assert self.local_cpu_backend is not None
+        assert self.connection is not None
+        memory_objs: List[Optional[MemoryObj]] = [
+            self.local_cpu_backend.get_blocking(key) for key in keys
+        ]
+        missing = [i for i, memory_obj in enumerate(memory_objs) if memory_obj is None]
+        if missing:
+            fetched: Sequence[Optional[MemoryObj]] = []
+            try:
+                # warning, this timeout will not actually stop the
+                # scheduler from waiting for the result
+                fetched = await asyncio.wait_for(
+                    self.connection.batched_get_non_blocking(
+                        lookup_id, [keys[i] for i in missing]
+                    ),
+                    self.config.blocking_timeout_secs,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("batched_get_non_blocking timed out")
+            except asyncio.CancelledError:
+                for memory_obj in memory_objs:
+                    if memory_obj is not None:
+                        memory_obj.ref_count_down()
+                raise
+            except Exception as e:
+                logger.warning("Error occurred in batched_get_non_blocking: %s", e)
+            for i, memory_obj in zip(missing, fetched, strict=False):
+                if memory_obj is not None:
+                    self.local_cpu_backend.submit_put_task(keys[i], memory_obj)
+                    memory_objs[i] = memory_obj
+
+        prefix: List[MemoryObj] = []
+        for i, memory_obj in enumerate(memory_objs):
+            if memory_obj is None:
+                # Chunks after a gap cannot be used.
+                for rest in memory_objs[i + 1 :]:
+                    if rest is not None:
+                        rest.ref_count_down()
+                break
+            prefix.append(memory_obj)
+        return prefix
 
     def pin(self, key: CacheEngineKey) -> bool:
         logger.debug(

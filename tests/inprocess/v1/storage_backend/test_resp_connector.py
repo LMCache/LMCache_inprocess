@@ -306,6 +306,54 @@ def test_resp_connector_batch_operations(
         close_asyncio_loop(async_loop, async_thread)
 
 
+def test_resp_prefetch_does_not_wait_for_memory_with_write_back(
+    resp_url, autorelease_v1
+):
+    """With remote_prefetch_write_back a prefetch without free memory is a miss."""
+    config = LMCacheEngineConfig.from_defaults(
+        extra_config={
+            "save_chunk_meta": False,
+            "resp_num_threads": 4,
+            "remote_prefetch_write_back": True,
+        }
+    )
+    local_backend = _create_local_cpu_backend(
+        PinMemoryAllocator(1024 * 1024 * 1024), config=config
+    )
+    async_loop, async_thread = init_asyncio_loop()
+    try:
+        connector = autorelease_v1(
+            CreateConnector(resp_url, async_loop, local_backend, config)
+        )
+        keys = [dumb_cache_engine_key(i) for i in range(3)]
+
+        allocated = []
+        busy_loops = []
+        real_allocate = local_backend.allocate
+
+        def one_chunk_left(*args, busy_loop=True, **kwargs):
+            busy_loops.append(busy_loop)
+            if allocated:
+                return None
+            allocated.append(real_allocate(*args, busy_loop=busy_loop, **kwargs))
+            return allocated[0]
+
+        with patch.object(local_backend, "allocate", one_chunk_left):
+            future = asyncio.run_coroutine_threadsafe(
+                connector.batched_get_non_blocking("lookup", keys), async_loop
+            )
+            memory_objs = _wait_for_future(
+                future, "batched_get_non_blocking", async_loop, async_thread
+            )
+
+        assert memory_objs == [None, None, None]
+        assert busy_loops == [False, False]
+        assert allocated[0].get_ref_count() == 0
+    finally:
+        close_asyncio_loop(async_loop, async_thread)
+        local_backend.close()
+
+
 def test_resp_connector_different_chunk_sizes(resp_url, autorelease_v1):
     """Test that different operations can use different chunk sizes."""
     async_loop, async_thread = init_asyncio_loop()

@@ -355,6 +355,27 @@ Settings shared by disk-based storage backends (local disk and GDS). These confi
      - 4
      - Number of worker threads in the disk I/O thread pool. Applies to both the local disk backend and the GDS backend. Increase for higher parallelism on fast NVMe drives. (Replaces the deprecated ``gds_io_threads`` key.)
 
+Remote Backend Configurations
+-----------------------------
+
+Settings for the remote backend (``remote_url``). These configurations are specified through ``extra_config``.
+
+.. code-block:: yaml
+
+    extra_config:
+      remote_prefetch_write_back: true
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Configuration Key
+     - Default
+     - Description
+   * - remote_prefetch_write_back
+     - false
+     - With ``enable_async_loading``, keep the chunks that a lookup prefetches from the remote store in the local CPU backend, so that later lookups for the same prefix read them from memory instead of fetching them again. Requires ``local_cpu: true``. A prefetch that finds no free local CPU memory without waiting counts as a miss (RESP connector).
+
 Nixl (as a storage backend) Configurations
 ------------------------------------------
 
