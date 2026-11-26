@@ -11,6 +11,7 @@ from typing import (
     List,
     Optional,
     Tuple,
+    TypeVar,
     Union,
 )
 
@@ -20,8 +21,10 @@ if TYPE_CHECKING:
 
 # Standard
 import asyncio
+import functools
 import gc
 import multiprocessing
+import threading
 import time
 
 # Third Party
@@ -69,6 +72,15 @@ from lmcache.v1.memory_management import (
 from lmcache.v1.platform import current_device_spec
 
 logger = init_logger(__name__)
+
+# Bounded retry for store-side CPU memory admission (store_admission_retry_ms).
+STORE_ADMISSION_RETRY_INTERVAL_SEC = 0.002
+# Hard ceiling for the configured retry window: a store that will drop anyway
+# must never stall its calling thread for an unbounded amount of time.
+STORE_ADMISSION_RETRY_MAX_MS = 100
+# Rate limit for the aggregated store-drop warning log.
+STORE_DROP_WARNING_INTERVAL_SEC = 10.0
+StoreAllocationT = TypeVar("StoreAllocationT")
 
 # Type aliases for processed chunks
 # (cache_key, memory_obj, start_index, end_index)
@@ -237,6 +249,14 @@ class LMCacheEngine:
         # Flag to indicate if initialization failed (irrecoverable error)
         self._init_failed = False
 
+        # Aggregation state for the rate-limited store-drop warning. store()
+        # may be reached from more than one thread, so the read-modify-write of
+        # these two fields is serialized by its own lock. The monitor counter
+        # is separately protected by @thread_safe.
+        self._store_drop_lock = threading.Lock()
+        self._last_store_drop_warning_time: float = 0.0
+        self._store_drops_since_warning: int = 0
+
         # Hidden-state cache (logically separate from KV; lives on its own
         # pinned pool). Bound to storage_manager in post_init for coupled
         # eviction. None when disabled in config.
@@ -382,6 +402,85 @@ class LMCacheEngine:
             return self.storage_manager.is_hot_cache_enabled()
         return False
 
+    def _retry_store_allocation(
+        self, alloc_fn: Callable[[], Optional[StoreAllocationT]]
+    ) -> Optional[StoreAllocationT]:
+        """Retry a failed store-side allocation within the configured budget.
+
+        The caller has already attempted the allocation once and received
+        ``None`` because eviction candidates were pinned by in-flight
+        requests. Re-attempting the allocation internally re-attempts
+        eviction, so a short bounded wait lets the chunk be admitted instead
+        of dropped. The configured budget is capped at
+        ``STORE_ADMISSION_RETRY_MAX_MS``; the deadline may be exceeded by at
+        most one retry interval (the last in-flight attempt is allowed to
+        finish).
+
+        :param alloc_fn: Zero-argument callable performing the allocation,
+            returning the object or ``None`` on failure.
+
+        :return: The successful allocation, or ``None`` when retries are
+            disabled or the retry budget is exhausted.
+        """
+        retry_ms = self.config.store_admission_retry_ms
+        if retry_ms <= 0:
+            return None
+        effective_ms = min(retry_ms, STORE_ADMISSION_RETRY_MAX_MS)
+        if effective_ms < retry_ms:
+            logger.debug(
+                "Capping store_admission_retry_ms from %d to %d ms",
+                retry_ms,
+                effective_ms,
+            )
+        deadline = time.monotonic() + effective_ms / 1000.0
+        while True:
+            time.sleep(STORE_ADMISSION_RETRY_INTERVAL_SEC)
+            obj = alloc_fn()
+            if obj is not None:
+                return obj
+            if time.monotonic() >= deadline:
+                return None
+
+    def _on_store_chunk_dropped(self, req_id: str, stored_so_far: int) -> None:
+        """Record a store-path drop event and emit a rate-limited warning.
+
+        Each drop event is counted in a Prometheus counter so pool
+        under-sizing is visible in metrics, and a warning is emitted at
+        most once per ``STORE_DROP_WARNING_INTERVAL_SEC`` so sustained
+        pressure does not spam the log. One drop event means the failing
+        chunk *and every later chunk of that request* were dropped (the
+        store loop breaks). The rate-limiting state is guarded by
+        ``_store_drop_lock``; the monitor counter has its own
+        ``@thread_safe`` lock, and the warning itself is emitted outside
+        the lock.
+        """
+        with self._store_drop_lock:
+            self._store_drops_since_warning += 1
+            now = time.monotonic()
+            should_warn = (
+                now - self._last_store_drop_warning_time
+                >= STORE_DROP_WARNING_INTERVAL_SEC
+            )
+            drops = self._store_drops_since_warning
+            if should_warn:
+                self._last_store_drop_warning_time = now
+                self._store_drops_since_warning = 0
+
+        self.stats_monitor.update_store_admission_failure_count(1)
+
+        if should_warn:
+            logger.warning(
+                "[req_id=%s] Could not allocate CPU memory for a store chunk "
+                "after bounded retry: storing only %d chunks of this request "
+                "and dropping the rest. The dropped chunks will not reach any "
+                "storage backend (%d drop events since the last warning). "
+                "Consider increasing max_local_cpu_size or setting "
+                "store_admission_retry_ms > 0.",
+                req_id,
+                stored_so_far,
+                drops,
+            )
+
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def store(
@@ -515,12 +614,19 @@ class LMCacheEngine:
                     fmt=self.fmt,
                 )
                 if memory_obj is None:
-                    logger.warning(
-                        "Local cpu memory under pressure so"
-                        " choosing to store only "
-                        " %d total chunks of KV cache.",
-                        len(memory_objs),
+                    memory_obj = self._retry_store_allocation(
+                        functools.partial(
+                            self.storage_manager.allocate,
+                            kv_shapes,
+                            kv_dtypes,
+                            busy_loop=self.config.get_extra_config_value(
+                                "force_store_wait", False
+                            ),
+                            fmt=self.fmt,
+                        )
                     )
+                if memory_obj is None:
+                    self._on_store_chunk_dropped(req_id, len(memory_objs))
                     break
 
                 starts.append(start)
@@ -711,10 +817,20 @@ class LMCacheEngine:
             )
 
             if memory_objs_multi_layer is None:
-                logger.warning(
-                    "Local cpu memory under pressure so"
-                    " choosing to not store the KV cache."
+                memory_objs_multi_layer = self._retry_store_allocation(
+                    functools.partial(
+                        self.storage_manager.batched_allocate,
+                        kv_shape_single_layer,
+                        kv_dtype,
+                        batch_size=self.num_layers,
+                        fmt=self.fmt,
+                        busy_loop=self.config.get_extra_config_value(
+                            "force_store_wait", False
+                        ),
+                    )
                 )
+            if memory_objs_multi_layer is None:
+                self._on_store_chunk_dropped(req_id, len(memory_objs))
                 break
 
             starts.append(start)
