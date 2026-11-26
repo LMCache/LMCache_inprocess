@@ -479,6 +479,18 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
+        # Opt-in: a chunk the local CPU backend already holds is not copied
+        # from the GPU again. Other backends are not given the chunk by this
+        # request either, so this only applies when the store targets all
+        # backends or the local CPU backend alone.
+        held_chunks_backend = None
+        if self.config.get_extra_config_value(
+            "store_skip_chunks_in_local_cpu", False
+        ) and self.store_location in (None, "LocalCPUBackend"):
+            held_chunks_backend = self.storage_manager.storage_backends.get(
+                "LocalCPUBackend"
+            )
+
         with store_stats.profile_process_tokens():
             prev_key = 0
             for start, end, key in self.token_database.process_tokens(
@@ -498,6 +510,14 @@ class LMCacheEngine:
                     logger.debug(
                         "Skipping empty token range [%d, %d) during store", start, end
                     )
+                    continue
+
+                if held_chunks_backend is not None and held_chunks_backend.contains(
+                    key
+                ):
+                    if self.kv_events_enabled:
+                        # Keep the parent chain of the chunks that follow.
+                        prev_key = key.chunk_hash
                     continue
 
                 # Allocate the memory object
