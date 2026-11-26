@@ -42,6 +42,8 @@ def _validate_vllm_device_features(config: LMCacheEngineConfig) -> None:
     2. ``config.use_layerwise=True`` on HPU — HPU only ships
        :class:`VLLMPagedMemHPUConnectorV2`; previously, the dispatch silently
        fell through to the CUDA layerwise connector.
+    3. ``config.use_layerwise=True`` on RBLN — RBLN compiles the full forward
+       graph, so vLLM never calls the per-layer hooks.
 
     Args:
         config: The LMCache engine configuration.
@@ -63,6 +65,13 @@ def _validate_vllm_device_features(config: LMCacheEngineConfig) -> None:
             "config.use_layerwise=True is not supported on HPU; LMCache "
             "ships no layerwise HPU connector. Set use_layerwise=False or "
             "run on a CUDA-capable build."
+        )
+
+    if torch_device_type == "rbln" and config.use_layerwise:
+        raise ValueError(
+            "config.use_layerwise=True is not supported on RBLN: the forward "
+            "graph is compiled whole, so per-layer hooks never run. Set "
+            "use_layerwise=False."
         )
 
 
@@ -95,6 +104,16 @@ def CreateGPUConnector(
             VLLMPagedMemGPUConnectorV3,
             VLLMPagedMemLayerwiseGPUConnector,
         )
+
+        if torch_device_type == "rbln":
+            # First Party
+            from lmcache.inprocess.v1.gpu_connector.rbln_connector import (
+                RBLNConnector,
+            )
+
+            # vLLM-RBLN binds each worker to its device; the connector stages
+            # on the device of the KV caches vLLM registers.
+            return RBLNConnector.from_metadata(metadata)
 
         local_worker_id = metadata.local_worker_id
         torch_dev.set_device(local_worker_id)
